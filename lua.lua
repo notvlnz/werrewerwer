@@ -23,6 +23,8 @@ local APPLY_WAIT_WINDOW = 5.0
 local APPLY_POLL_STEP = 0.08
 local APPLY_STABLE_POLLS = 2
 local BETWEEN_OUTFITS_DELAY = 0.4
+local APPLY_RETRIES = 2
+local RESET_SETTLE_DELAY = 0.35
 
 local CommunityRemote = ReplicatedStorage:WaitForChild("CommunityOutfitsRemote", 8)
 local CatalogGuiRemote = ReplicatedStorage:WaitForChild("CatalogGuiRemote", 8)
@@ -35,6 +37,7 @@ local currentIdToken = nil
 local tokenExpiresAt = 0
 
 local MY_USER_ID = tostring(Player.UserId)
+local WORKER_ID = MY_USER_ID .. ":" .. HttpService:GenerateGUID(false)
 local usernameCache = {}
 
 local requestImpl = (syn and syn.request) or (http and http.request) or request
@@ -123,7 +126,7 @@ local function createCleanLogger()
 	logBox.TextXAlignment = Enum.TextXAlignment.Left
 	logBox.TextYAlignment = Enum.TextYAlignment.Top
 	logBox.TextWrapped = false
-	logBox.Text = "[CAC] Logger started - " .. os.date("%H:%M:%S") .. " - Worker " .. MY_USER_ID
+	logBox.Text = "[CAC] Logger started - " .. os.date("%H:%M:%S") .. " - Worker " .. WORKER_ID
 	logBox.Parent = frame
 
 	local function addLine(message)
@@ -266,7 +269,8 @@ local function tryClaim(requestId)
 	end
 
 	local claimed = patchRequest(requestId, {
-		claimedBy = MY_USER_ID,
+		claimedBy = WORKER_ID,
+		claimedUserId = MY_USER_ID,
 		claimedAt = os.time(),
 		processing = true,
 	})
@@ -277,7 +281,7 @@ local function tryClaim(requestId)
 	task.wait(0.03 + math.random() * 0.04)
 
 	local after = httpJson("GET", url)
-	if not after or after.claimedBy ~= MY_USER_ID then
+	if not after or after.claimedBy ~= WORKER_ID then
 		log("Claim lost race -> " .. requestId)
 		return false
 	end
@@ -463,6 +467,20 @@ local function buildDescriptionFingerprint(humanoid, description)
 	}, ";")
 end
 
+local function readDescriptionSnapshot(timeoutSeconds)
+	local _, humanoid = getCharacterHumanoid(timeoutSeconds or 2)
+	if not humanoid then
+		return nil, nil, nil
+	end
+
+	local description = getHumanoidDescriptionObject(humanoid, 1)
+	if not description then
+		return humanoid, nil, nil
+	end
+
+	return humanoid, description, buildDescriptionFingerprint(humanoid, description)
+end
+
 local function waitForFreshDescription(beforeFingerprint)
 	local deadline = tick() + APPLY_WAIT_WINDOW
 	local bestHumanoid = nil
@@ -507,7 +525,7 @@ local function waitForFreshDescription(beforeFingerprint)
 		return changedHumanoid, changedDescription
 	end
 
-	return bestHumanoid, bestDescription
+	return nil, nil
 end
 
 local function descriptionToResult(humanoid, description)
@@ -573,17 +591,6 @@ local function processSingleOutfit(hexCode, requesterName)
 
 	log("Processing - " .. requesterName .. " - code " .. tostring(code))
 
-	local _, humanoidBefore = getCharacterHumanoid(3)
-	if not humanoidBefore then
-		return { error = "Humanoid not found" }
-	end
-
-	local beforeDescription = getHumanoidDescriptionObject(humanoidBefore, 1.5)
-	if not beforeDescription then
-		return { error = "No HumanoidDescription" }
-	end
-
-	local beforeFingerprint = buildDescriptionFingerprint(humanoidBefore, beforeDescription)
 	local outfitSuccess, outfitInfo = pcall(function()
 		return CommunityRemote:InvokeServer({
 			Action = "GetFromOutfitCode",
@@ -594,33 +601,43 @@ local function processSingleOutfit(hexCode, requesterName)
 		return { error = "Failed to fetch outfit" }
 	end
 
-	local wearSuccess = pcall(function()
-		CommunityRemote:InvokeServer({
-			Action = "WearCommunityOutfit",
-			OutfitInfo = outfitInfo,
-		})
-	end)
-	if not wearSuccess then
-		return { error = "Failed to wear outfit" }
-	end
-
-	task.wait(0.2)
-
-	local humanoidAfter, descriptionAfter = waitForFreshDescription(beforeFingerprint)
-	if not humanoidAfter or not descriptionAfter then
-		local _, fallbackHumanoid = getCharacterHumanoid(1.5)
-		local fallbackDescription = fallbackHumanoid and getHumanoidDescriptionObject(fallbackHumanoid, 0.5) or nil
-		if fallbackHumanoid and fallbackDescription then
-			local fallback = descriptionToResult(fallbackHumanoid, fallbackDescription)
-			log("Done - fallback read - " .. tostring(#(((fallback.Accessories or {}).Other) or {})) .. " accessories")
-			return fallback
+	for attempt = 1, APPLY_RETRIES do
+		if attempt > 1 then
+			log("Retrying apply - code " .. tostring(code) .. " - attempt " .. tostring(attempt))
 		end
-		return { error = "Failed to read outfit" }
+
+		forceResetCharacter()
+		task.wait(RESET_SETTLE_DELAY)
+
+		local _, beforeDescription, beforeFingerprint = readDescriptionSnapshot(3)
+		if not beforeDescription or not beforeFingerprint then
+			return { error = "No baseline HumanoidDescription" }
+		end
+
+		local wearSuccess = pcall(function()
+			CommunityRemote:InvokeServer({
+				Action = "WearCommunityOutfit",
+				OutfitInfo = outfitInfo,
+			})
+		end)
+		if not wearSuccess then
+			return { error = "Failed to wear outfit" }
+		end
+
+		task.wait(0.2)
+
+		local humanoidAfter, descriptionAfter = waitForFreshDescription(beforeFingerprint)
+		local afterFingerprint = buildDescriptionFingerprint(humanoidAfter, descriptionAfter)
+		if humanoidAfter and descriptionAfter and afterFingerprint and afterFingerprint ~= beforeFingerprint then
+			local result = descriptionToResult(humanoidAfter, descriptionAfter)
+			log("Done - " .. tostring(#(((result.Accessories or {}).Other) or {})) .. " accessories")
+			return result
+		end
+
+		log("Apply did not produce a fresh outfit - code " .. tostring(code))
 	end
 
-	local result = descriptionToResult(humanoidAfter, descriptionAfter)
-	log("Done - " .. tostring(#(((result.Accessories or {}).Other) or {})) .. " accessories")
-	return result
+	return { error = "Outfit did not apply cleanly" }
 end
 
 local function processRequest(requestId, data)
