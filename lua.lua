@@ -11,14 +11,15 @@ local Workspace = game:GetService("Workspace")
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui", 8)
 
-local FIREBASE_URL = "https://cacc-c57bf-default-rtdb.firebaseio.com/"
-local API_KEY = "AIzaSyBquxKffIm2lBtpi90GLLDdrQG_0yvlo4Y"
+local FIREBASE_URL = "https://cacd-cb138-default-rtdb.europe-west1.firebasedatabase.app/"
+local API_KEY = "goSIyaChDWz73BudJuNF8eZqVOj7zfsBkM0sELMv"
 
 local POLL_INTERVAL = 0.2
 local AUTH_REFRESH_MARGIN = 300
 local MAX_LOG_LINES = 120
 local CLAIM_TIMEOUT = 60
 local RECENT_REQUEST_LIMIT = 25
+local SERVER_OFFSET_REFRESH_INTERVAL = 60
 
 local APPLY_WAIT_WINDOW = 5.0
 local APPLY_POLL_STEP = 0.08
@@ -36,6 +37,8 @@ local active = true
 local isProcessing = false
 local currentIdToken = nil
 local tokenExpiresAt = 0
+local serverTimeOffsetMs = 0
+local serverTimeOffsetRefreshedAt = 0
 
 local MY_USER_ID = tostring(Player.UserId)
 local WORKER_ID = MY_USER_ID .. ":" .. HttpService:GenerateGUID(false)
@@ -236,18 +239,34 @@ local function ensureAuthToken()
 	return refreshAuthToken()
 end
 
+local function refreshServerTimeOffset()
+	if tick() - serverTimeOffsetRefreshedAt < SERVER_OFFSET_REFRESH_INTERVAL then
+		return
+	end
+
+	if not ensureAuthToken() then
+		return
+	end
+
+	local offset = httpJson("GET", FIREBASE_URL .. ".info/serverTimeOffset.json?auth=" .. currentIdToken)
+	if typeof(offset) == "number" then
+		serverTimeOffsetMs = offset
+		serverTimeOffsetRefreshedAt = tick()
+	end
+end
+
+local function firebaseNowMillis()
+	refreshServerTimeOffset()
+	return (os.time() * 1000) + serverTimeOffsetMs
+end
+
 local function getRequests()
 	if not ensureAuthToken() then
 		return {}
 	end
 
-	local recentUrl = FIREBASE_URL .. "requests.json?auth=" .. currentIdToken .. "&orderBy=%22requestedAt%22&limitToLast=" .. tostring(RECENT_REQUEST_LIMIT)
-	local recent = httpJson("GET", recentUrl)
-	if recent then
-		return recent
-	end
-
-	return httpJson("GET", FIREBASE_URL .. "requests.json?auth=" .. currentIdToken) or {}
+	local recentUrl = FIREBASE_URL .. "requests.json?auth=" .. currentIdToken .. "&orderBy=%22%24key%22&limitToLast=" .. tostring(RECENT_REQUEST_LIMIT)
+	return httpJson("GET", recentUrl) or {}
 end
 
 local function patchRequest(requestId, data)
@@ -268,7 +287,7 @@ end
 
 local function requestExpired(data)
 	local expiresAt = tonumber(data and data.expiresAt)
-	return expiresAt and expiresAt <= (os.time() * 1000)
+	return expiresAt and expiresAt <= firebaseNowMillis()
 end
 
 local function claimTimedOut(data)
@@ -350,7 +369,7 @@ local function tryClaim(requestId)
 	end
 
 	local requestedAt = tonumber(after.requestedAt)
-	local ageText = requestedAt and (" - age " .. tostring(roundNumber((os.time() * 1000 - requestedAt) / 1000, 2)) .. "s") or ""
+	local ageText = requestedAt and (" - age " .. tostring(roundNumber((firebaseNowMillis() - requestedAt) / 1000, 2)) .. "s") or ""
 	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. requestId .. ageText)
 	return true
 end
