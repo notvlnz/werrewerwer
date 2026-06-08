@@ -18,6 +18,7 @@ local POLL_INTERVAL = 0.2
 local AUTH_REFRESH_MARGIN = 300
 local MAX_LOG_LINES = 120
 local CLAIM_TIMEOUT = 60
+local RECENT_REQUEST_LIMIT = 25
 
 local APPLY_WAIT_WINDOW = 5.0
 local APPLY_POLL_STEP = 0.08
@@ -240,6 +241,12 @@ local function getRequests()
 		return {}
 	end
 
+	local recentUrl = FIREBASE_URL .. "requests.json?auth=" .. currentIdToken .. "&orderBy=%22requestedAt%22&limitToLast=" .. tostring(RECENT_REQUEST_LIMIT)
+	local recent = httpJson("GET", recentUrl)
+	if recent then
+		return recent
+	end
+
 	return httpJson("GET", FIREBASE_URL .. "requests.json?auth=" .. currentIdToken) or {}
 end
 
@@ -251,6 +258,63 @@ local function patchRequest(requestId, data)
 	return patchJson(FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken, data)
 end
 
+local function getRequestCodes(data)
+	if typeof(data) ~= "table" then
+		return {}
+	end
+
+	return data.codes or (data.code and { data.code }) or {}
+end
+
+local function requestExpired(data)
+	local expiresAt = tonumber(data and data.expiresAt)
+	return expiresAt and expiresAt <= (os.time() * 1000)
+end
+
+local function claimTimedOut(data)
+	local claimedAt = tonumber(data and data.claimedAt)
+	return claimedAt and data.claimedBy and (os.time() - claimedAt >= CLAIM_TIMEOUT) or false
+end
+
+local function shouldTryRequest(data)
+	if typeof(data) ~= "table" or data.result or requestExpired(data) then
+		return false
+	end
+
+	if #getRequestCodes(data) <= 0 then
+		return false
+	end
+
+	if data.claimedBy or data.processing then
+		return claimTimedOut(data)
+	end
+
+	return true
+end
+
+local function getPendingRequests()
+	local pending = {}
+	for requestId, data in pairs(getRequests()) do
+		if shouldTryRequest(data) then
+			table.insert(pending, {
+				requestId = requestId,
+				data = data,
+				requestedAt = tonumber(data.requestedAt) or 0,
+			})
+		end
+	end
+
+	table.sort(pending, function(a, b)
+		if a.requestedAt ~= b.requestedAt then
+			return a.requestedAt > b.requestedAt
+		end
+
+		return tostring(a.requestId) > tostring(b.requestId)
+	end)
+
+	return pending
+end
+
 local function tryClaim(requestId)
 	if not ensureAuthToken() then
 		return false
@@ -258,12 +322,11 @@ local function tryClaim(requestId)
 
 	local url = FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken
 	local current = httpJson("GET", url)
-	if not current or current.result then
+	if not current or current.result or requestExpired(current) then
 		return false
 	end
 
-	local claimedAt = tonumber(current.claimedAt)
-	local timedOut = claimedAt and current.claimedBy and (os.time() - claimedAt >= CLAIM_TIMEOUT) or false
+	local timedOut = claimTimedOut(current)
 	if not timedOut and (current.claimedBy or current.processing) then
 		return false
 	end
@@ -286,7 +349,9 @@ local function tryClaim(requestId)
 		return false
 	end
 
-	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. requestId)
+	local requestedAt = tonumber(after.requestedAt)
+	local ageText = requestedAt and (" - age " .. tostring(roundNumber((os.time() * 1000 - requestedAt) / 1000, 2)) .. "s") or ""
+	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. requestId .. ageText)
 	return true
 end
 
@@ -687,15 +752,11 @@ task.spawn(function()
 		end
 
 		local startedAt = tick()
-		local requests = getRequests()
 
-		for requestId, data in pairs(requests) do
-			local codes = (data and data.codes) or (data and data.code and { data.code }) or {}
-			if #codes > 0 and not data.result then
-				if tryClaim(requestId) then
-					task.spawn(processRequest, requestId, data)
-					break
-				end
+		for _, pendingRequest in ipairs(getPendingRequests()) do
+			if tryClaim(pendingRequest.requestId) then
+				task.spawn(processRequest, pendingRequest.requestId, pendingRequest.data)
+				break
 			end
 		end
 
