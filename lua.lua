@@ -11,22 +11,18 @@ local Workspace = game:GetService("Workspace")
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui", 8)
 
-local FIREBASE_URL = "https://cacd-cb138-default-rtdb.europe-west1.firebasedatabase.app/"
+local FIREBASE_URL = "https://cacd-cb138-default-rtdb.firebaseio.com/"
 local API_KEY = "goSIyaChDWz73BudJuNF8eZqVOj7zfsBkM0sELMv"
 
 local POLL_INTERVAL = 0.2
 local AUTH_REFRESH_MARGIN = 300
 local MAX_LOG_LINES = 120
 local CLAIM_TIMEOUT = 60
-local RECENT_REQUEST_LIMIT = 25
-local SERVER_OFFSET_REFRESH_INTERVAL = 60
 
 local APPLY_WAIT_WINDOW = 5.0
 local APPLY_POLL_STEP = 0.08
 local APPLY_STABLE_POLLS = 2
 local BETWEEN_OUTFITS_DELAY = 0.4
-local APPLY_RETRIES = 2
-local RESET_SETTLE_DELAY = 0.35
 
 local CommunityRemote = ReplicatedStorage:WaitForChild("CommunityOutfitsRemote", 8)
 local CatalogGuiRemote = ReplicatedStorage:WaitForChild("CatalogGuiRemote", 8)
@@ -37,11 +33,8 @@ local active = true
 local isProcessing = false
 local currentIdToken = nil
 local tokenExpiresAt = 0
-local serverTimeOffsetMs = 0
-local serverTimeOffsetRefreshedAt = 0
 
 local MY_USER_ID = tostring(Player.UserId)
-local WORKER_ID = MY_USER_ID .. ":" .. HttpService:GenerateGUID(false)
 local usernameCache = {}
 
 local requestImpl = (syn and syn.request) or (http and http.request) or request
@@ -130,7 +123,7 @@ local function createCleanLogger()
 	logBox.TextXAlignment = Enum.TextXAlignment.Left
 	logBox.TextYAlignment = Enum.TextYAlignment.Top
 	logBox.TextWrapped = false
-	logBox.Text = "[CAC] Logger started - " .. os.date("%H:%M:%S") .. " - Worker " .. WORKER_ID
+	logBox.Text = "[CAC] Logger started - " .. os.date("%H:%M:%S") .. " - Worker " .. MY_USER_ID
 	logBox.Parent = frame
 
 	local function addLine(message)
@@ -239,34 +232,12 @@ local function ensureAuthToken()
 	return refreshAuthToken()
 end
 
-local function refreshServerTimeOffset()
-	if tick() - serverTimeOffsetRefreshedAt < SERVER_OFFSET_REFRESH_INTERVAL then
-		return
-	end
-
-	if not ensureAuthToken() then
-		return
-	end
-
-	local offset = httpJson("GET", FIREBASE_URL .. ".info/serverTimeOffset.json?auth=" .. currentIdToken)
-	if typeof(offset) == "number" then
-		serverTimeOffsetMs = offset
-		serverTimeOffsetRefreshedAt = tick()
-	end
-end
-
-local function firebaseNowMillis()
-	refreshServerTimeOffset()
-	return (os.time() * 1000) + serverTimeOffsetMs
-end
-
 local function getRequests()
 	if not ensureAuthToken() then
 		return {}
 	end
 
-	local recentUrl = FIREBASE_URL .. "requests.json?auth=" .. currentIdToken .. "&orderBy=%22%24key%22&limitToLast=" .. tostring(RECENT_REQUEST_LIMIT)
-	return httpJson("GET", recentUrl) or {}
+	return httpJson("GET", FIREBASE_URL .. "requests.json?auth=" .. currentIdToken) or {}
 end
 
 local function patchRequest(requestId, data)
@@ -277,63 +248,6 @@ local function patchRequest(requestId, data)
 	return patchJson(FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken, data)
 end
 
-local function getRequestCodes(data)
-	if typeof(data) ~= "table" then
-		return {}
-	end
-
-	return data.codes or (data.code and { data.code }) or {}
-end
-
-local function requestExpired(data)
-	local expiresAt = tonumber(data and data.expiresAt)
-	return expiresAt and expiresAt <= firebaseNowMillis()
-end
-
-local function claimTimedOut(data)
-	local claimedAt = tonumber(data and data.claimedAt)
-	return claimedAt and data.claimedBy and (os.time() - claimedAt >= CLAIM_TIMEOUT) or false
-end
-
-local function shouldTryRequest(data)
-	if typeof(data) ~= "table" or data.result or requestExpired(data) then
-		return false
-	end
-
-	if #getRequestCodes(data) <= 0 then
-		return false
-	end
-
-	if data.claimedBy or data.processing then
-		return claimTimedOut(data)
-	end
-
-	return true
-end
-
-local function getPendingRequests()
-	local pending = {}
-	for requestId, data in pairs(getRequests()) do
-		if shouldTryRequest(data) then
-			table.insert(pending, {
-				requestId = requestId,
-				data = data,
-				requestedAt = tonumber(data.requestedAt) or 0,
-			})
-		end
-	end
-
-	table.sort(pending, function(a, b)
-		if a.requestedAt ~= b.requestedAt then
-			return a.requestedAt > b.requestedAt
-		end
-
-		return tostring(a.requestId) > tostring(b.requestId)
-	end)
-
-	return pending
-end
-
 local function tryClaim(requestId)
 	if not ensureAuthToken() then
 		return false
@@ -341,18 +255,18 @@ local function tryClaim(requestId)
 
 	local url = FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken
 	local current = httpJson("GET", url)
-	if not current or current.result or requestExpired(current) then
+	if not current or current.result then
 		return false
 	end
 
-	local timedOut = claimTimedOut(current)
+	local claimedAt = tonumber(current.claimedAt)
+	local timedOut = claimedAt and current.claimedBy and (os.time() - claimedAt >= CLAIM_TIMEOUT) or false
 	if not timedOut and (current.claimedBy or current.processing) then
 		return false
 	end
 
 	local claimed = patchRequest(requestId, {
-		claimedBy = WORKER_ID,
-		claimedUserId = MY_USER_ID,
+		claimedBy = MY_USER_ID,
 		claimedAt = os.time(),
 		processing = true,
 	})
@@ -363,14 +277,12 @@ local function tryClaim(requestId)
 	task.wait(0.03 + math.random() * 0.04)
 
 	local after = httpJson("GET", url)
-	if not after or after.claimedBy ~= WORKER_ID then
+	if not after or after.claimedBy ~= MY_USER_ID then
 		log("Claim lost race -> " .. requestId)
 		return false
 	end
 
-	local requestedAt = tonumber(after.requestedAt)
-	local ageText = requestedAt and (" - age " .. tostring(roundNumber((firebaseNowMillis() - requestedAt) / 1000, 2)) .. "s") or ""
-	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. requestId .. ageText)
+	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. requestId)
 	return true
 end
 
@@ -551,20 +463,6 @@ local function buildDescriptionFingerprint(humanoid, description)
 	}, ";")
 end
 
-local function readDescriptionSnapshot(timeoutSeconds)
-	local _, humanoid = getCharacterHumanoid(timeoutSeconds or 2)
-	if not humanoid then
-		return nil, nil, nil
-	end
-
-	local description = getHumanoidDescriptionObject(humanoid, 1)
-	if not description then
-		return humanoid, nil, nil
-	end
-
-	return humanoid, description, buildDescriptionFingerprint(humanoid, description)
-end
-
 local function waitForFreshDescription(beforeFingerprint)
 	local deadline = tick() + APPLY_WAIT_WINDOW
 	local bestHumanoid = nil
@@ -609,7 +507,7 @@ local function waitForFreshDescription(beforeFingerprint)
 		return changedHumanoid, changedDescription
 	end
 
-	return nil, nil
+	return bestHumanoid, bestDescription
 end
 
 local function descriptionToResult(humanoid, description)
@@ -675,6 +573,17 @@ local function processSingleOutfit(hexCode, requesterName)
 
 	log("Processing - " .. requesterName .. " - code " .. tostring(code))
 
+	local _, humanoidBefore = getCharacterHumanoid(3)
+	if not humanoidBefore then
+		return { error = "Humanoid not found" }
+	end
+
+	local beforeDescription = getHumanoidDescriptionObject(humanoidBefore, 1.5)
+	if not beforeDescription then
+		return { error = "No HumanoidDescription" }
+	end
+
+	local beforeFingerprint = buildDescriptionFingerprint(humanoidBefore, beforeDescription)
 	local outfitSuccess, outfitInfo = pcall(function()
 		return CommunityRemote:InvokeServer({
 			Action = "GetFromOutfitCode",
@@ -685,43 +594,33 @@ local function processSingleOutfit(hexCode, requesterName)
 		return { error = "Failed to fetch outfit" }
 	end
 
-	for attempt = 1, APPLY_RETRIES do
-		if attempt > 1 then
-			log("Retrying apply - code " .. tostring(code) .. " - attempt " .. tostring(attempt))
-		end
-
-		forceResetCharacter()
-		task.wait(RESET_SETTLE_DELAY)
-
-		local _, beforeDescription, beforeFingerprint = readDescriptionSnapshot(3)
-		if not beforeDescription or not beforeFingerprint then
-			return { error = "No baseline HumanoidDescription" }
-		end
-
-		local wearSuccess = pcall(function()
-			CommunityRemote:InvokeServer({
-				Action = "WearCommunityOutfit",
-				OutfitInfo = outfitInfo,
-			})
-		end)
-		if not wearSuccess then
-			return { error = "Failed to wear outfit" }
-		end
-
-		task.wait(0.2)
-
-		local humanoidAfter, descriptionAfter = waitForFreshDescription(beforeFingerprint)
-		local afterFingerprint = buildDescriptionFingerprint(humanoidAfter, descriptionAfter)
-		if humanoidAfter and descriptionAfter and afterFingerprint and afterFingerprint ~= beforeFingerprint then
-			local result = descriptionToResult(humanoidAfter, descriptionAfter)
-			log("Done - " .. tostring(#(((result.Accessories or {}).Other) or {})) .. " accessories")
-			return result
-		end
-
-		log("Apply did not produce a fresh outfit - code " .. tostring(code))
+	local wearSuccess = pcall(function()
+		CommunityRemote:InvokeServer({
+			Action = "WearCommunityOutfit",
+			OutfitInfo = outfitInfo,
+		})
+	end)
+	if not wearSuccess then
+		return { error = "Failed to wear outfit" }
 	end
 
-	return { error = "Outfit did not apply cleanly" }
+	task.wait(0.2)
+
+	local humanoidAfter, descriptionAfter = waitForFreshDescription(beforeFingerprint)
+	if not humanoidAfter or not descriptionAfter then
+		local _, fallbackHumanoid = getCharacterHumanoid(1.5)
+		local fallbackDescription = fallbackHumanoid and getHumanoidDescriptionObject(fallbackHumanoid, 0.5) or nil
+		if fallbackHumanoid and fallbackDescription then
+			local fallback = descriptionToResult(fallbackHumanoid, fallbackDescription)
+			log("Done - fallback read - " .. tostring(#(((fallback.Accessories or {}).Other) or {})) .. " accessories")
+			return fallback
+		end
+		return { error = "Failed to read outfit" }
+	end
+
+	local result = descriptionToResult(humanoidAfter, descriptionAfter)
+	log("Done - " .. tostring(#(((result.Accessories or {}).Other) or {})) .. " accessories")
+	return result
 end
 
 local function processRequest(requestId, data)
@@ -771,11 +670,15 @@ task.spawn(function()
 		end
 
 		local startedAt = tick()
+		local requests = getRequests()
 
-		for _, pendingRequest in ipairs(getPendingRequests()) do
-			if tryClaim(pendingRequest.requestId) then
-				task.spawn(processRequest, pendingRequest.requestId, pendingRequest.data)
-				break
+		for requestId, data in pairs(requests) do
+			local codes = (data and data.codes) or (data and data.code and { data.code }) or {}
+			if #codes > 0 and not data.result then
+				if tryClaim(requestId) then
+					task.spawn(processRequest, requestId, data)
+					break
+				end
 			end
 		end
 
