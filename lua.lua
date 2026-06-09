@@ -2,27 +2,21 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local VirtualUser = game:GetService("VirtualUser")
-local RunService = game:GetService("RunService")
-local Lighting = game:GetService("Lighting")
-local StarterGui = game:GetService("StarterGui")
-local UserInputService = game:GetService("UserInputService")
-local Workspace = game:GetService("Workspace")
 
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui", 8)
 
-local FIREBASE_URL = "https://cacd-cb138-default-rtdb.firebaseio.com/"
-local API_KEY = "goSIyaChDWz73BudJuNF8eZqVOj7zfsBkM0sELMv"
+local FIREBASE_URL = "https://importer-41f0d-default-rtdb.firebaseio.com/"
+local API_KEY = "AIzaSyC27Wj2awyQuzBjja4kd3t32E21oM6Sd3Y"
 
-local POLL_INTERVAL = 0.2
+local POLL_INTERVAL = 0.3
 local AUTH_REFRESH_MARGIN = 300
-local MAX_LOG_LINES = 120
-local CLAIM_TIMEOUT = 60
+local CLAIM_TIMEOUT = 75
 
-local APPLY_WAIT_WINDOW = 5.0
+local APPLY_WAIT_WINDOW = 6.5
 local APPLY_POLL_STEP = 0.08
-local APPLY_STABLE_POLLS = 2
-local BETWEEN_OUTFITS_DELAY = 0.4
+local APPLY_STABLE_POLLS = 4
+local BETWEEN_OUTFITS_DELAY = 0.55
 
 local CommunityRemote = ReplicatedStorage:WaitForChild("CommunityOutfitsRemote", 8)
 local CatalogGuiRemote = ReplicatedStorage:WaitForChild("CatalogGuiRemote", 8)
@@ -35,6 +29,7 @@ local currentIdToken = nil
 local tokenExpiresAt = 0
 
 local MY_USER_ID = tostring(Player.UserId)
+local SESSION_ID = MY_USER_ID .. "-" .. HttpService:GenerateGUID(false)
 local usernameCache = {}
 
 local requestImpl = (syn and syn.request) or (http and http.request) or request
@@ -49,112 +44,93 @@ local function roundNumber(value, decimals)
 	return math.floor(value * factor + 0.5) / factor
 end
 
-local function optimizeGraphics()
-	pcall(function()
-		settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-	end)
-	pcall(function()
-		RunService:Set3dRenderingEnabled(false)
-	end)
-
-	Lighting.GlobalShadows = false
-	Lighting.Brightness = 1
-	Lighting.Ambient = Color3.new(1, 1, 1)
-	Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
-	Lighting.EnvironmentDiffuseScale = 0
-	Lighting.EnvironmentSpecularScale = 0
-	Lighting.Technology = Enum.Technology.Compatibility
-
-	for _, effect in ipairs(Lighting:GetChildren()) do
-		if effect:IsA("PostEffect") then
-			effect.Enabled = false
-		end
-	end
-
-	pcall(function()
-		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, false)
-	end)
-	pcall(function()
-		StarterGui:SetCore("ChatActive", false)
-	end)
-
-	pcall(function()
-		UserInputService.MouseIconEnabled = false
-	end)
-
-	local terrain = Workspace:FindFirstChildOfClass("Terrain")
-	if terrain then
-		terrain.WaterReflectance = 0
-		terrain.WaterTransparency = 1
-		terrain.WaterWaveSize = 0
-		terrain.WaterWaveSpeed = 0
-	end
-
-	for _, obj in ipairs(Workspace:GetDescendants()) do
-		if obj:IsA("Texture") or obj:IsA("Decal") then
-			obj.Texture = ""
-		elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
-			obj.Enabled = false
-		end
-	end
-
-	log("Graphics optimized for max FPS")
-end
-
 local function createCleanLogger()
+	local old = PlayerGui:FindFirstChild("CACLogger")
+	if old then
+		old:Destroy()
+	end
+
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "CACLogger"
 	gui.ResetOnSpawn = false
 	gui.Parent = PlayerGui
 
 	local frame = Instance.new("Frame")
-	frame.Size = UDim2.fromOffset(540, 320)
+	frame.Size = UDim2.fromOffset(360, 116)
 	frame.Position = UDim2.fromOffset(16, 16)
-	frame.BackgroundColor3 = Color3.fromRGB(17, 17, 23)
+	frame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
 	frame.BorderSizePixel = 0
 	frame.Parent = gui
 
-	local logBox = Instance.new("TextLabel")
-	logBox.Size = UDim2.fromScale(1, 1)
-	logBox.BackgroundTransparency = 1
-	logBox.TextColor3 = Color3.new(1, 1, 1)
-	logBox.Font = Enum.Font.Code
-	logBox.TextSize = 13.5
-	logBox.TextXAlignment = Enum.TextXAlignment.Left
-	logBox.TextYAlignment = Enum.TextYAlignment.Top
-	logBox.TextWrapped = false
-	logBox.Text = "[CAC] Logger started - " .. os.date("%H:%M:%S") .. " - Worker " .. MY_USER_ID
-	logBox.Parent = frame
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 12)
+	corner.Parent = frame
 
-	local function addLine(message)
-		print("[CAC] " .. message)
-		if not logBox.Parent then
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -104, 0, 30)
+	title.Position = UDim2.fromOffset(14, 10)
+	title.BackgroundTransparency = 1
+	title.TextColor3 = Color3.fromRGB(245, 245, 255)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Text = "CAC Importer"
+	title.Parent = frame
+
+	local status = Instance.new("TextLabel")
+	status.Size = UDim2.new(1, -28, 0, 24)
+	status.Position = UDim2.fromOffset(14, 45)
+	status.BackgroundTransparency = 1
+	status.TextColor3 = Color3.fromRGB(205, 210, 225)
+	status.Font = Enum.Font.Gotham
+	status.TextSize = 13
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.TextTruncate = Enum.TextTruncate.AtEnd
+	status.Text = "Starting"
+	status.Parent = frame
+
+	local detail = Instance.new("TextLabel")
+	detail.Size = UDim2.new(1, -28, 0, 22)
+	detail.Position = UDim2.fromOffset(14, 70)
+	detail.BackgroundTransparency = 1
+	detail.TextColor3 = Color3.fromRGB(140, 148, 166)
+	detail.Font = Enum.Font.Gotham
+	detail.TextSize = 12
+	detail.TextXAlignment = Enum.TextXAlignment.Left
+	detail.TextTruncate = Enum.TextTruncate.AtEnd
+	detail.Text = "Worker " .. MY_USER_ID
+	detail.Parent = frame
+
+	local stopButton = Instance.new("TextButton")
+	stopButton.Size = UDim2.fromOffset(74, 28)
+	stopButton.Position = UDim2.new(1, -88, 0, 12)
+	stopButton.BackgroundColor3 = Color3.fromRGB(210, 60, 60)
+	stopButton.TextColor3 = Color3.new(1, 1, 1)
+	stopButton.Font = Enum.Font.GothamBold
+	stopButton.TextSize = 12
+	stopButton.Text = "STOP"
+	stopButton.Parent = frame
+
+	local stopCorner = Instance.new("UICorner")
+	stopCorner.CornerRadius = UDim.new(0, 8)
+	stopCorner.Parent = stopButton
+
+	stopButton.MouseButton1Click:Connect(function()
+		active = false
+		status.Text = "Stopped"
+		detail.Text = "Listener disabled"
+	end)
+
+	return function(message, subMessage)
+		if not gui.Parent then
 			return
 		end
 
-		logBox.Text = logBox.Text .. "\n" .. message
-		local lines = string.split(logBox.Text, "\n")
-		if #lines > MAX_LOG_LINES then
-			logBox.Text = table.concat(lines, "\n", #lines - MAX_LOG_LINES + 1)
+		status.Text = tostring(message or "")
+		if subMessage ~= nil then
+			detail.Text = tostring(subMessage)
 		end
 	end
-
-	local stopButton = Instance.new("TextButton")
-	stopButton.Size = UDim2.fromOffset(86, 26)
-	stopButton.Position = UDim2.new(1, -94, 0, 6)
-	stopButton.BackgroundColor3 = Color3.fromRGB(210, 60, 60)
-	stopButton.TextColor3 = Color3.new(1, 1, 1)
-	stopButton.Font = Enum.Font.Code
-	stopButton.TextSize = 13
-	stopButton.Text = "STOP"
-	stopButton.Parent = frame
-	stopButton.MouseButton1Click:Connect(function()
-		active = false
-		gui:Destroy()
-		warn("[CAC] Listener manually terminated")
-	end)
-
-	return addLine
 end
 
 log = createCleanLogger()
@@ -208,19 +184,19 @@ local function patchJson(url, body)
 end
 
 local function refreshAuthToken()
-	log("Refreshing Firebase token")
+	log("Refreshing auth")
 	local data = httpJson("POST", "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. API_KEY, {
 		returnSecureToken = true,
 	})
 
 	if not data or not data.idToken then
-		log("Firebase auth failed")
+		log("Auth failed")
 		return false
 	end
 
 	currentIdToken = data.idToken
 	tokenExpiresAt = tick() + (tonumber(data.expiresIn) or 3600) - AUTH_REFRESH_MARGIN
-	log("Token refreshed")
+	log("Ready", "Worker " .. MY_USER_ID)
 	return true
 end
 
@@ -248,54 +224,72 @@ local function patchRequest(requestId, data)
 	return patchJson(FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken, data)
 end
 
-local function tryClaim(requestId)
+local function getRequest(requestId)
 	if not ensureAuthToken() then
-		return false
+		return nil
 	end
 
-	local url = FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken
-	local current = httpJson("GET", url)
+	return httpJson("GET", FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken)
+end
+
+local function tryClaim(requestId)
+	if not ensureAuthToken() then
+		return false, nil
+	end
+
+	local current = getRequest(requestId)
 	if not current or current.result then
-		return false
+		return false, current
 	end
 
 	local claimedAt = tonumber(current.claimedAt)
 	local timedOut = claimedAt and current.claimedBy and (os.time() - claimedAt >= CLAIM_TIMEOUT) or false
 	if not timedOut and (current.claimedBy or current.processing) then
-		return false
+		return false, current
 	end
 
 	local claimed = patchRequest(requestId, {
 		claimedBy = MY_USER_ID,
+		claimedSession = SESSION_ID,
 		claimedAt = os.time(),
 		processing = true,
 	})
 	if not claimed then
-		return false
+		return false, current
 	end
 
-	task.wait(0.03 + math.random() * 0.04)
+	task.wait(0.06 + math.random() * 0.05)
 
-	local after = httpJson("GET", url)
-	if not after or after.claimedBy ~= MY_USER_ID then
-		log("Claim lost race -> " .. requestId)
-		return false
+	local after = getRequest(requestId)
+	if not after or after.claimedBy ~= MY_USER_ID or after.claimedSession ~= SESSION_ID or after.result then
+		return false, after
 	end
 
-	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. requestId)
-	return true
+	return true, after
 end
 
 local function sendResult(requestId, payload)
-	if patchRequest(requestId, {
+	local current = getRequest(requestId)
+	if not current or current.result or current.claimedBy ~= MY_USER_ID or current.claimedSession ~= SESSION_ID then
+		log("Skipped stale result", requestId)
+		return false
+	end
+
+	local sent = patchRequest(requestId, {
 		result = payload,
 		processing = false,
 		finishedAt = os.time(),
-	}) then
-		log("Result sent for " .. requestId)
+		completedBy = MY_USER_ID,
+		completedSession = SESSION_ID,
+	})
+
+	if sent then
+		log("Result sent", requestId)
 	else
-		log("Failed to send result for " .. requestId)
+		log("Failed to send result", requestId)
 	end
+
+	return sent
 end
 
 local function forceResetCharacter()
@@ -311,7 +305,6 @@ local function forceResetCharacter()
 			UpdateStatusRemote:FireServer("None")
 		end
 	end)
-	log("Character reset")
 end
 
 local function getUsername(userIdStr)
@@ -493,8 +486,12 @@ local function waitForFreshDescription(beforeFingerprint)
 					end
 
 					if stablePolls >= APPLY_STABLE_POLLS then
-						task.wait(0.08)
-						return changedHumanoid, changedDescription
+						task.wait(0.12)
+						local _, finalHumanoid = getCharacterHumanoid(0.8)
+						local finalDescription = finalHumanoid and getHumanoidDescriptionObject(finalHumanoid, 0.4) or nil
+						if finalHumanoid and finalDescription and buildDescriptionFingerprint(finalHumanoid, finalDescription) == lastChangedFingerprint then
+							return finalHumanoid, finalDescription
+						end
 					end
 				end
 			end
@@ -571,7 +568,7 @@ local function processSingleOutfit(hexCode, requesterName)
 		return { error = "Invalid outfit code" }
 	end
 
-	log("Processing - " .. requesterName .. " - code " .. tostring(code))
+	log("Processing outfit", requesterName .. " - " .. tostring(hexCode))
 
 	local _, humanoidBefore = getCharacterHumanoid(3)
 	if not humanoidBefore then
@@ -611,57 +608,62 @@ local function processSingleOutfit(hexCode, requesterName)
 		local _, fallbackHumanoid = getCharacterHumanoid(1.5)
 		local fallbackDescription = fallbackHumanoid and getHumanoidDescriptionObject(fallbackHumanoid, 0.5) or nil
 		if fallbackHumanoid and fallbackDescription then
-			local fallback = descriptionToResult(fallbackHumanoid, fallbackDescription)
-			log("Done - fallback read - " .. tostring(#(((fallback.Accessories or {}).Other) or {})) .. " accessories")
-			return fallback
+			return descriptionToResult(fallbackHumanoid, fallbackDescription)
 		end
 		return { error = "Failed to read outfit" }
 	end
 
-	local result = descriptionToResult(humanoidAfter, descriptionAfter)
-	log("Done - " .. tostring(#(((result.Accessories or {}).Other) or {})) .. " accessories")
-	return result
+	return descriptionToResult(humanoidAfter, descriptionAfter)
 end
 
 local function processRequest(requestId, data)
 	isProcessing = true
 
-	local requesterName = data.username or getUsername(tostring(data.userId or "unknown"))
-	log("Processing request from - " .. requesterName .. " - " .. requestId)
+	local latest = getRequest(requestId) or data
+	if not latest or latest.result or latest.claimedBy ~= MY_USER_ID or latest.claimedSession ~= SESSION_ID then
+		isProcessing = false
+		return
+	end
+
+	local requesterName = latest.username or getUsername(tostring(latest.userId or "unknown"))
+	log("Processing request", requesterName .. " - " .. requestId)
 
 	local success, err = pcall(function()
 		local result = {}
-		local codes = data.codes or (data.code and { data.code }) or {}
+		local codes = latest.codes or (latest.code and { latest.code }) or {}
 
 		for index, hexCode in ipairs(codes) do
+			local current = getRequest(requestId)
+			if not current or current.result or current.claimedBy ~= MY_USER_ID or current.claimedSession ~= SESSION_ID then
+				return
+			end
+
 			result["outfit" .. index] = processSingleOutfit(hexCode, requesterName)
 			if index < #codes then
 				task.wait(BETWEEN_OUTFITS_DELAY + math.random() * 0.06)
 			end
 		end
 
-		task.wait(0.18)
+		task.wait(0.2)
 		forceResetCharacter()
 		sendResult(requestId, result)
 	end)
 
 	if not success then
-		log("Error in processing " .. tostring(err))
+		log("Processing error", tostring(err))
 		sendResult(requestId, { error = tostring(err) })
 	end
 
 	isProcessing = false
 end
 
-task.spawn(optimizeGraphics)
-
 task.spawn(function()
 	if not refreshAuthToken() then
-		log("Initial auth failed -> stopping")
+		log("Initial auth failed")
 		return
 	end
 
-	log("Listener active - poll " .. tostring(POLL_INTERVAL) .. "s - optimized CAC importer")
+	log("Ready", "Waiting for requests")
 
 	while active do
 		if isProcessing then
@@ -675,8 +677,9 @@ task.spawn(function()
 		for requestId, data in pairs(requests) do
 			local codes = (data and data.codes) or (data and data.code and { data.code }) or {}
 			if #codes > 0 and not data.result then
-				if tryClaim(requestId) then
-					task.spawn(processRequest, requestId, data)
+				local claimed, claimedData = tryClaim(requestId)
+				if claimed then
+					task.spawn(processRequest, requestId, claimedData or data)
 					break
 				end
 			end
@@ -696,7 +699,6 @@ task.spawn(function()
 			break
 		end
 
-		log("Anti-AFK triggered")
 		pcall(function()
 			VirtualUser:CaptureController()
 			VirtualUser:ClickButton2(Vector2.new())
@@ -705,4 +707,4 @@ task.spawn(function()
 	end
 end)
 
-log("CAC ready - original description reads with lighter speed tuning - 2026")
+log("Ready", "Waiting for requests ta dah")
