@@ -626,7 +626,7 @@ local function processSingleOutfit(hexCode, requesterName, previousAcceptedFinge
 
 	if not confirmed or not humanoidAfter or not descriptionAfter or not finalFingerprint then
 		return {
-			error = "Outfit did not fully apply in time",
+			error = "Outfit failed. Try using fewer codes at a time!",
 			code = tostring(hexCode),
 		}, nil
 	end
