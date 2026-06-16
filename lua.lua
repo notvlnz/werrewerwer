@@ -13,18 +13,21 @@ local POLL_INTERVAL = 0.3
 local AUTH_REFRESH_MARGIN = 300
 local CLAIM_TIMEOUT = 75
 
--- Does NOT slow every outfit by this much. This is only the max wait.
 local APPLY_WAIT_WINDOW = 8.5
-
--- Fast polling, but we only accept once the avatar stops changing.
 local APPLY_POLL_STEP = 0.06
 local APPLY_STABLE_SECONDS = 0.45
 local APPLY_FINAL_VERIFY_DELAY = 0.12
 
--- Lower now because the stable-wait already handles most settling.
 local BETWEEN_OUTFITS_DELAY = 0.18
+local ERROR_RECOVERY_DELAY = 0.35
 
--- Only used if the next outfit looks exactly like the previous one.
+local REMOTE_FETCH_TIMEOUT = 7
+local REMOTE_WEAR_TIMEOUT = 7
+local REMOTE_RESET_TIMEOUT = 4
+
+local RESET_WAIT_WINDOW = 5
+local RESET_STABLE_SECONDS = 0.45
+
 local SUSPECT_DUPLICATE_EXTRA_WAIT = 1.15
 
 local CommunityRemote = ReplicatedStorage:WaitForChild("CommunityOutfitsRemote", 8)
@@ -192,6 +195,33 @@ local function patchJson(url, body)
 	return success and response and response.StatusCode >= 200 and response.StatusCode < 300
 end
 
+local function invokeServerWithTimeout(remote, payload, timeoutSeconds)
+	if not remote then
+		return false, "Remote missing", false
+	end
+
+	local done = false
+	local ok = false
+	local result = nil
+
+	task.spawn(function()
+		ok, result = pcall(function()
+			return remote:InvokeServer(payload)
+		end)
+		done = true
+	end)
+
+	local deadline = tick() + (timeoutSeconds or 5)
+	repeat
+		if done then
+			return ok, result, false
+		end
+		task.wait(0.03)
+	until tick() >= deadline
+
+	return false, "Remote timed out", true
+end
+
 local function refreshAuthToken()
 	log("Refreshing auth")
 	local data = httpJson("POST", "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. API_KEY, {
@@ -312,13 +342,12 @@ local function sendResult(requestId, payload)
 end
 
 local function forceResetCharacter()
-	pcall(function()
-		CatalogGuiRemote:InvokeServer({
-			Action = "MorphIntoPlayer",
-			UserId = Player.UserId,
-			RigType = Enum.HumanoidRigType.R15,
-		})
-	end)
+	invokeServerWithTimeout(CatalogGuiRemote, {
+		Action = "MorphIntoPlayer",
+		UserId = Player.UserId,
+		RigType = Enum.HumanoidRigType.R15,
+	}, REMOTE_RESET_TIMEOUT)
+
 	pcall(function()
 		if UpdateStatusRemote then
 			UpdateStatusRemote:FireServer("None")
@@ -490,8 +519,22 @@ local function readCurrentDescription(timeoutCharacter, timeoutDescription)
 	return humanoid, description, fingerprint
 end
 
-local function waitForStableDifferentDescription(beforeFingerprint, maxWait)
-	local deadline = tick() + (maxWait or APPLY_WAIT_WINDOW)
+local function isRejectedFingerprint(fingerprint, rejectedFingerprints)
+	if not fingerprint or not rejectedFingerprints then
+		return false
+	end
+
+	for _, rejected in ipairs(rejectedFingerprints) do
+		if rejected and fingerprint == rejected then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function waitForStableCurrentDescription(maxWait)
+	local deadline = tick() + (maxWait or RESET_WAIT_WINDOW)
 
 	local lastFingerprint = nil
 	local lastChangedAt = 0
@@ -501,7 +544,7 @@ local function waitForStableDifferentDescription(beforeFingerprint, maxWait)
 	repeat
 		local humanoid, description, fingerprint = readCurrentDescription(0.75, 0.22)
 
-		if humanoid and description and fingerprint and fingerprint ~= beforeFingerprint then
+		if humanoid and description and fingerprint then
 			if fingerprint ~= lastFingerprint then
 				lastFingerprint = fingerprint
 				lastChangedAt = tick()
@@ -512,7 +555,7 @@ local function waitForStableDifferentDescription(beforeFingerprint, maxWait)
 				latestDescription = description
 			end
 
-			if tick() - lastChangedAt >= APPLY_STABLE_SECONDS then
+			if tick() - lastChangedAt >= RESET_STABLE_SECONDS then
 				task.wait(APPLY_FINAL_VERIFY_DELAY)
 
 				local finalHumanoid, finalDescription, finalFingerprint = readCurrentDescription(0.75, 0.35)
@@ -526,6 +569,67 @@ local function waitForStableDifferentDescription(beforeFingerprint, maxWait)
 	until tick() >= deadline
 
 	return latestHumanoid, latestDescription, lastFingerprint, false
+end
+
+local function resetAndWaitForStable(label)
+	log("Resetting avatar", label or "")
+	forceResetCharacter()
+
+	local humanoid, description, fingerprint, confirmed = waitForStableCurrentDescription(RESET_WAIT_WINDOW)
+	if confirmed and fingerprint then
+		log("Reset stable", label or "")
+	else
+		log("Reset not confirmed", label or "")
+	end
+
+	return humanoid, description, fingerprint, confirmed
+end
+
+local function waitForStableDifferentDescription(beforeFingerprint, maxWait, rejectedFingerprints)
+	local deadline = tick() + (maxWait or APPLY_WAIT_WINDOW)
+
+	local lastFingerprint = nil
+	local lastChangedAt = 0
+	local latestHumanoid = nil
+	local latestDescription = nil
+	local sawRejected = false
+
+	repeat
+		local humanoid, description, fingerprint = readCurrentDescription(0.75, 0.22)
+
+		if humanoid and description and fingerprint and fingerprint ~= beforeFingerprint then
+			if isRejectedFingerprint(fingerprint, rejectedFingerprints) then
+				sawRejected = true
+			else
+				if fingerprint ~= lastFingerprint then
+					lastFingerprint = fingerprint
+					lastChangedAt = tick()
+					latestHumanoid = humanoid
+					latestDescription = description
+				else
+					latestHumanoid = humanoid
+					latestDescription = description
+				end
+
+				if tick() - lastChangedAt >= APPLY_STABLE_SECONDS then
+					task.wait(APPLY_FINAL_VERIFY_DELAY)
+
+					local finalHumanoid, finalDescription, finalFingerprint = readCurrentDescription(0.75, 0.35)
+					if finalHumanoid
+						and finalDescription
+						and finalFingerprint == lastFingerprint
+						and not isRejectedFingerprint(finalFingerprint, rejectedFingerprints)
+					then
+						return finalHumanoid, finalDescription, finalFingerprint, true, sawRejected
+					end
+				end
+			end
+		end
+
+		task.wait(APPLY_POLL_STEP)
+	until tick() >= deadline
+
+	return latestHumanoid, latestDescription, lastFingerprint, false, sawRejected
 end
 
 local function descriptionToResult(humanoid, description)
@@ -583,76 +687,99 @@ local function descriptionToResult(humanoid, description)
 	}
 end
 
-local function processSingleOutfit(hexCode, requesterName, previousAcceptedFingerprint, previousCode)
+local function makeError(message, hexCode)
+	return {
+		code = tostring(hexCode),
+		error = message,
+	}
+end
+
+local function processSingleOutfit(hexCode, requesterName, previousAcceptedFingerprint, previousCode, resetFingerprint)
 	local code = tonumber(hexCode, 16)
 	if not code then
-		return { error = "Invalid outfit code" }, nil
+		return makeError("Invalid outfit code", hexCode), nil, false, false
 	end
 
 	log("Processing outfit", requesterName .. " - " .. tostring(hexCode))
 
+	local rejectedFingerprints = {}
+	if resetFingerprint then
+		table.insert(rejectedFingerprints, resetFingerprint)
+	end
+
 	local humanoidBefore, beforeDescription, beforeFingerprint = readCurrentDescription(3, 1.5)
 	if not humanoidBefore then
-		return { error = "Humanoid not found" }, nil
+		return makeError("Humanoid not found", hexCode), nil, false, true
 	end
 	if not beforeDescription or not beforeFingerprint then
-		return { error = "No HumanoidDescription" }, nil
+		return makeError("No HumanoidDescription", hexCode), nil, false, true
 	end
 
-	local outfitSuccess, outfitInfo = pcall(function()
-		return CommunityRemote:InvokeServer({
-			Action = "GetFromOutfitCode",
-			OutfitCode = code,
-		})
-	end)
+	log("Fetching outfit", tostring(hexCode))
+
+	local outfitSuccess, outfitInfo, outfitTimedOut = invokeServerWithTimeout(CommunityRemote, {
+		Action = "GetFromOutfitCode",
+		OutfitCode = code,
+	}, REMOTE_FETCH_TIMEOUT)
 
 	if not outfitSuccess or not outfitInfo then
-		return { error = "Failed to fetch outfit" }, nil
+		return makeError(outfitTimedOut and "Outfit fetch timed out. Please try again." or "Failed to fetch outfit", hexCode), nil, false, false
 	end
 
-	local wearSuccess = pcall(function()
-		CommunityRemote:InvokeServer({
-			Action = "WearCommunityOutfit",
-			OutfitInfo = outfitInfo,
-		})
-	end)
+	log("Wearing outfit", tostring(hexCode))
 
-	if not wearSuccess then
-		return { error = "Failed to wear outfit" }, nil
+	local wearSuccess, _, wearTimedOut = invokeServerWithTimeout(CommunityRemote, {
+		Action = "WearCommunityOutfit",
+		OutfitInfo = outfitInfo,
+	}, REMOTE_WEAR_TIMEOUT)
+
+	if not wearSuccess and not wearTimedOut then
+		return makeError("Failed to wear outfit", hexCode), nil, false, true
 	end
 
-	local humanoidAfter, descriptionAfter, finalFingerprint, confirmed =
-		waitForStableDifferentDescription(beforeFingerprint, APPLY_WAIT_WINDOW)
+	if wearTimedOut then
+		log("Wear timed out, checking avatar", tostring(hexCode))
+	else
+		log("Waiting for avatar", tostring(hexCode))
+	end
+
+	local humanoidAfter, descriptionAfter, finalFingerprint, confirmed, sawRejected =
+		waitForStableDifferentDescription(beforeFingerprint, APPLY_WAIT_WINDOW, rejectedFingerprints)
 
 	if not confirmed or not humanoidAfter or not descriptionAfter or not finalFingerprint then
-		return {
-			error = "Outfit failed. Try using fewer codes at a time!",
-			code = tostring(hexCode),
-		}, nil
+		if sawRejected then
+			return makeError("Outfit failed because the worker/reset avatar was detected, not saved.", hexCode), nil, wearTimedOut, true
+		end
+
+		return makeError(
+			wearTimedOut and "Outfit wear timed out. Please retry this code." or "Outfit failed. Try using fewer codes at a time!",
+			hexCode
+		), nil, wearTimedOut, true
 	end
 
-	-- If 2 different codes produce the exact same fingerprint back-to-back,
-	-- that is often the old stale/duplicate bug. Wait a tiny bit more only in this suspicious case.
+	if resetFingerprint and finalFingerprint == resetFingerprint then
+		return makeError("Outfit matched the worker/reset avatar, not saved.", hexCode), nil, false, true
+	end
+
 	if previousAcceptedFingerprint
 		and finalFingerprint == previousAcceptedFingerprint
 		and tostring(hexCode) ~= tostring(previousCode)
 	then
+		log("Checking duplicate read", tostring(hexCode))
+
 		local retryHumanoid, retryDescription, retryFingerprint, retryConfirmed =
-			waitForStableDifferentDescription(finalFingerprint, SUSPECT_DUPLICATE_EXTRA_WAIT)
+			waitForStableDifferentDescription(finalFingerprint, SUSPECT_DUPLICATE_EXTRA_WAIT, rejectedFingerprints)
 
 		if retryConfirmed and retryHumanoid and retryDescription and retryFingerprint then
 			humanoidAfter = retryHumanoid
 			descriptionAfter = retryDescription
 			finalFingerprint = retryFingerprint
 		else
-			return {
-				error = "Possible stale duplicate read, outfit was not saved",
-				code = tostring(hexCode),
-			}, nil
+			return makeError("Possible stale duplicate read, outfit was not saved", hexCode), nil, false, true
 		end
 	end
 
-	return descriptionToResult(humanoidAfter, descriptionAfter), finalFingerprint
+	return descriptionToResult(humanoidAfter, descriptionAfter), finalFingerprint, false, false
 end
 
 local function processRequest(requestId, data)
@@ -674,6 +801,8 @@ local function processRequest(requestId, data)
 		local previousAcceptedFingerprint = nil
 		local previousCode = nil
 
+		local _, _, resetFingerprint = resetAndWaitForStable("Request start")
+
 		for index, hexCode in ipairs(codes) do
 			local current = getRequest(requestId)
 			if not current or current.result or current.claimedBy ~= MY_USER_ID or current.claimedSession ~= SESSION_ID then
@@ -682,23 +811,43 @@ local function processRequest(requestId, data)
 
 			heartbeatClaim(requestId, index)
 
-			local outfitResult, acceptedFingerprint =
-				processSingleOutfit(hexCode, requesterName, previousAcceptedFingerprint, previousCode)
+			local outfitResult, acceptedFingerprint, stopRemaining, needsReset =
+				processSingleOutfit(hexCode, requesterName, previousAcceptedFingerprint, previousCode, resetFingerprint)
 
-			result["outfit" .. index] = outfitResult
+			result["outfit" .. index] = outfitResult or makeError("Unknown outfit error", hexCode)
 
 			if outfitResult and not outfitResult.error and acceptedFingerprint then
 				previousAcceptedFingerprint = acceptedFingerprint
 				previousCode = hexCode
 			end
 
-			if index < #codes then
+			if stopRemaining then
+				log("Stopping request safely", tostring(hexCode))
+
+				for nextIndex = index + 1, #codes do
+					result["outfit" .. nextIndex] = makeError(
+						"Skipped because the previous outfit timed out. Retry these codes.",
+						codes[nextIndex]
+					)
+				end
+
+				break
+			end
+
+			if needsReset then
+				local _, _, newResetFingerprint = resetAndWaitForStable("Recovering")
+				if newResetFingerprint then
+					resetFingerprint = newResetFingerprint
+				end
+
+				task.wait(ERROR_RECOVERY_DELAY)
+			elseif index < #codes then
 				task.wait(BETWEEN_OUTFITS_DELAY + math.random() * 0.04)
 			end
 		end
 
 		task.wait(0.15)
-		forceResetCharacter()
+		resetAndWaitForStable("Finished")
 		sendResult(requestId, result)
 	end)
 
@@ -756,6 +905,7 @@ task.spawn(function()
 			VirtualUser:CaptureController()
 			VirtualUser:ClickButton2(Vector2.new())
 		end)
+
 		task.wait(285 + math.random(0, 30))
 	end
 end)
