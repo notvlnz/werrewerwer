@@ -2,29 +2,27 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local VirtualUser = game:GetService("VirtualUser")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local StarterGui = game:GetService("StarterGui")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
 
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui", 8)
 
-local FIREBASE_URL = "https://importer-41f0d-default-rtdb.firebaseio.com/"
-local API_KEY = "AIzaSyC27Wj2awyQuzBjja4kd3t32E21oM6Sd3Y"
+local FIREBASE_URL = "https://cacc-c57bf-default-rtdb.firebaseio.com/"
+local API_KEY = "AIzaSyBquxKffIm2lBtpi90GLLDdrQG_0yvlo4Y"
 
-local POLL_INTERVAL = 0.3
+local POLL_INTERVAL = 0.2
 local AUTH_REFRESH_MARGIN = 300
-local CLAIM_TIMEOUT = 120
+local MAX_LOG_LINES = 120
+local CLAIM_TIMEOUT = 60
 
--- Max wait only. Fast outfits finish much sooner.
-local APPLY_WAIT_WINDOW = 9
+local APPLY_WAIT_WINDOW = 5.0
 local APPLY_POLL_STEP = 0.08
-local APPLY_STABLE_SECONDS = 0.65
-local APPLY_FINAL_VERIFY_DELAY = 0.15
-local MIN_POST_WEAR_WAIT = 0.25
-
--- Keep this small. The stable wait is what matters.
-local BETWEEN_OUTFITS_DELAY = 0.28
-
--- Only used if a new code appears to return the same outfit as the last code.
-local SUSPECT_DUPLICATE_EXTRA_WAIT = 1.35
+local APPLY_STABLE_POLLS = 2
+local BETWEEN_OUTFITS_DELAY = 0.4
 
 local CommunityRemote = ReplicatedStorage:WaitForChild("CommunityOutfitsRemote", 8)
 local CatalogGuiRemote = ReplicatedStorage:WaitForChild("CatalogGuiRemote", 8)
@@ -37,7 +35,6 @@ local currentIdToken = nil
 local tokenExpiresAt = 0
 
 local MY_USER_ID = tostring(Player.UserId)
-local SESSION_ID = MY_USER_ID .. "-" .. HttpService:GenerateGUID(false)
 local usernameCache = {}
 
 local requestImpl = (syn and syn.request) or (http and http.request) or request
@@ -52,93 +49,112 @@ local function roundNumber(value, decimals)
 	return math.floor(value * factor + 0.5) / factor
 end
 
-local function createCleanLogger()
-	local old = PlayerGui:FindFirstChild("CACLogger")
-	if old then
-		old:Destroy()
+local function optimizeGraphics()
+	pcall(function()
+		settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+	end)
+	pcall(function()
+		RunService:Set3dRenderingEnabled(false)
+	end)
+
+	Lighting.GlobalShadows = false
+	Lighting.Brightness = 1
+	Lighting.Ambient = Color3.new(1, 1, 1)
+	Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+	Lighting.EnvironmentDiffuseScale = 0
+	Lighting.EnvironmentSpecularScale = 0
+	Lighting.Technology = Enum.Technology.Compatibility
+
+	for _, effect in ipairs(Lighting:GetChildren()) do
+		if effect:IsA("PostEffect") then
+			effect.Enabled = false
+		end
 	end
 
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, false)
+	end)
+	pcall(function()
+		StarterGui:SetCore("ChatActive", false)
+	end)
+
+	pcall(function()
+		UserInputService.MouseIconEnabled = false
+	end)
+
+	local terrain = Workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		terrain.WaterReflectance = 0
+		terrain.WaterTransparency = 1
+		terrain.WaterWaveSize = 0
+		terrain.WaterWaveSpeed = 0
+	end
+
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if obj:IsA("Texture") or obj:IsA("Decal") then
+			obj.Texture = ""
+		elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
+			obj.Enabled = false
+		end
+	end
+
+	log("Graphics optimized for max FPS")
+end
+
+local function createCleanLogger()
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "CACLogger"
 	gui.ResetOnSpawn = false
 	gui.Parent = PlayerGui
 
 	local frame = Instance.new("Frame")
-	frame.Size = UDim2.fromOffset(360, 116)
+	frame.Size = UDim2.fromOffset(540, 320)
 	frame.Position = UDim2.fromOffset(16, 16)
-	frame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+	frame.BackgroundColor3 = Color3.fromRGB(17, 17, 23)
 	frame.BorderSizePixel = 0
 	frame.Parent = gui
 
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 12)
-	corner.Parent = frame
+	local logBox = Instance.new("TextLabel")
+	logBox.Size = UDim2.fromScale(1, 1)
+	logBox.BackgroundTransparency = 1
+	logBox.TextColor3 = Color3.new(1, 1, 1)
+	logBox.Font = Enum.Font.Code
+	logBox.TextSize = 13.5
+	logBox.TextXAlignment = Enum.TextXAlignment.Left
+	logBox.TextYAlignment = Enum.TextYAlignment.Top
+	logBox.TextWrapped = false
+	logBox.Text = "[CAC] Logger started - " .. os.date("%H:%M:%S") .. " - Worker " .. MY_USER_ID
+	logBox.Parent = frame
 
-	local title = Instance.new("TextLabel")
-	title.Size = UDim2.new(1, -104, 0, 30)
-	title.Position = UDim2.fromOffset(14, 10)
-	title.BackgroundTransparency = 1
-	title.TextColor3 = Color3.fromRGB(245, 245, 255)
-	title.Font = Enum.Font.GothamBold
-	title.TextSize = 16
-	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Text = "CAC Importer"
-	title.Parent = frame
-
-	local status = Instance.new("TextLabel")
-	status.Size = UDim2.new(1, -28, 0, 24)
-	status.Position = UDim2.fromOffset(14, 45)
-	status.BackgroundTransparency = 1
-	status.TextColor3 = Color3.fromRGB(205, 210, 225)
-	status.Font = Enum.Font.Gotham
-	status.TextSize = 13
-	status.TextXAlignment = Enum.TextXAlignment.Left
-	status.TextTruncate = Enum.TextTruncate.AtEnd
-	status.Text = "Starting"
-	status.Parent = frame
-
-	local detail = Instance.new("TextLabel")
-	detail.Size = UDim2.new(1, -28, 0, 22)
-	detail.Position = UDim2.fromOffset(14, 70)
-	detail.BackgroundTransparency = 1
-	detail.TextColor3 = Color3.fromRGB(140, 148, 166)
-	detail.Font = Enum.Font.Gotham
-	detail.TextSize = 12
-	detail.TextXAlignment = Enum.TextXAlignment.Left
-	detail.TextTruncate = Enum.TextTruncate.AtEnd
-	detail.Text = "Worker " .. MY_USER_ID
-	detail.Parent = frame
-
-	local stopButton = Instance.new("TextButton")
-	stopButton.Size = UDim2.fromOffset(74, 28)
-	stopButton.Position = UDim2.new(1, -88, 0, 12)
-	stopButton.BackgroundColor3 = Color3.fromRGB(210, 60, 60)
-	stopButton.TextColor3 = Color3.new(1, 1, 1)
-	stopButton.Font = Enum.Font.GothamBold
-	stopButton.TextSize = 12
-	stopButton.Text = "STOP"
-	stopButton.Parent = frame
-
-	local stopCorner = Instance.new("UICorner")
-	stopCorner.CornerRadius = UDim.new(0, 8)
-	stopCorner.Parent = stopButton
-
-	stopButton.MouseButton1Click:Connect(function()
-		active = false
-		status.Text = "Stopped"
-		detail.Text = "Listener disabled"
-	end)
-
-	return function(message, subMessage)
-		if not gui.Parent then
+	local function addLine(message)
+		print("[CAC] " .. message)
+		if not logBox.Parent then
 			return
 		end
 
-		status.Text = tostring(message or "")
-		if subMessage ~= nil then
-			detail.Text = tostring(subMessage)
+		logBox.Text = logBox.Text .. "\n" .. message
+		local lines = string.split(logBox.Text, "\n")
+		if #lines > MAX_LOG_LINES then
+			logBox.Text = table.concat(lines, "\n", #lines - MAX_LOG_LINES + 1)
 		end
 	end
+
+	local stopButton = Instance.new("TextButton")
+	stopButton.Size = UDim2.fromOffset(86, 26)
+	stopButton.Position = UDim2.new(1, -94, 0, 6)
+	stopButton.BackgroundColor3 = Color3.fromRGB(210, 60, 60)
+	stopButton.TextColor3 = Color3.new(1, 1, 1)
+	stopButton.Font = Enum.Font.Code
+	stopButton.TextSize = 13
+	stopButton.Text = "STOP"
+	stopButton.Parent = frame
+	stopButton.MouseButton1Click:Connect(function()
+		active = false
+		gui:Destroy()
+		warn("[CAC] Listener manually terminated")
+	end)
+
+	return addLine
 end
 
 log = createCleanLogger()
@@ -192,19 +208,19 @@ local function patchJson(url, body)
 end
 
 local function refreshAuthToken()
-	log("Refreshing auth")
+	log("Refreshing Firebase token")
 	local data = httpJson("POST", "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. API_KEY, {
 		returnSecureToken = true,
 	})
 
 	if not data or not data.idToken then
-		log("Auth failed")
+		log("Firebase auth failed")
 		return false
 	end
 
 	currentIdToken = data.idToken
 	tokenExpiresAt = tick() + (tonumber(data.expiresIn) or 3600) - AUTH_REFRESH_MARGIN
-	log("Ready", "Worker " .. MY_USER_ID)
+	log("Token refreshed")
 	return true
 end
 
@@ -232,82 +248,54 @@ local function patchRequest(requestId, data)
 	return patchJson(FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken, data)
 end
 
-local function getRequest(requestId)
-	if not ensureAuthToken() then
-		return nil
-	end
-
-	return httpJson("GET", FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken)
-end
-
 local function tryClaim(requestId)
 	if not ensureAuthToken() then
-		return false, nil
+		return false
 	end
 
-	local current = getRequest(requestId)
+	local url = FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken
+	local current = httpJson("GET", url)
 	if not current or current.result then
-		return false, current
+		return false
 	end
 
 	local claimedAt = tonumber(current.claimedAt)
 	local timedOut = claimedAt and current.claimedBy and (os.time() - claimedAt >= CLAIM_TIMEOUT) or false
 	if not timedOut and (current.claimedBy or current.processing) then
-		return false, current
+		return false
 	end
 
 	local claimed = patchRequest(requestId, {
 		claimedBy = MY_USER_ID,
-		claimedSession = SESSION_ID,
 		claimedAt = os.time(),
 		processing = true,
 	})
 	if not claimed then
-		return false, current
-	end
-
-	task.wait(0.06 + math.random() * 0.05)
-
-	local after = getRequest(requestId)
-	if not after or after.claimedBy ~= MY_USER_ID or after.claimedSession ~= SESSION_ID or after.result then
-		return false, after
-	end
-
-	return true, after
-end
-
-local function heartbeatClaim(requestId, index)
-	patchRequest(requestId, {
-		claimedAt = os.time(),
-		processing = true,
-		currentIndex = index,
-		claimedBy = MY_USER_ID,
-		claimedSession = SESSION_ID,
-	})
-end
-
-local function sendResult(requestId, payload)
-	local current = getRequest(requestId)
-	if not current or current.result or current.claimedBy ~= MY_USER_ID or current.claimedSession ~= SESSION_ID then
-		log("Skipped stale result", requestId)
 		return false
 	end
 
-	local sent = patchRequest(requestId, {
+	task.wait(0.03 + math.random() * 0.04)
+
+	local after = httpJson("GET", url)
+	if not after or after.claimedBy ~= MY_USER_ID then
+		log("Claim lost race -> " .. requestId)
+		return false
+	end
+
+	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. requestId)
+	return true
+end
+
+local function sendResult(requestId, payload)
+	if patchRequest(requestId, {
 		result = payload,
 		processing = false,
 		finishedAt = os.time(),
-		completedBy = MY_USER_ID,
-		completedSession = SESSION_ID,
-	})
-
-	if sent then
-		log("Result sent", requestId)
+	}) then
+		log("Result sent for " .. requestId)
 	else
-		log("Failed to send result", requestId)
+		log("Failed to send result for " .. requestId)
 	end
-
-	return sent
 end
 
 local function forceResetCharacter()
@@ -318,12 +306,12 @@ local function forceResetCharacter()
 			RigType = Enum.HumanoidRigType.R15,
 		})
 	end)
-
 	pcall(function()
 		if UpdateStatusRemote then
 			UpdateStatusRemote:FireServer("None")
 		end
 	end)
+	log("Character reset")
 end
 
 local function getUsername(userIdStr)
@@ -475,49 +463,39 @@ local function buildDescriptionFingerprint(humanoid, description)
 	}, ";")
 end
 
-local function readCurrentDescription(timeoutCharacter, timeoutDescription)
-	local _, humanoid = getCharacterHumanoid(timeoutCharacter or 1)
-	if not humanoid then
-		return nil, nil, nil
-	end
-
-	local description = getHumanoidDescriptionObject(humanoid, timeoutDescription or 0.4)
-	if not description then
-		return humanoid, nil, nil
-	end
-
-	local fingerprint = buildDescriptionFingerprint(humanoid, description)
-	return humanoid, description, fingerprint
-end
-
-local function waitForStableChangedDescription(beforeFingerprint, previousAcceptedFingerprint, previousCode, hexCode)
+local function waitForFreshDescription(beforeFingerprint)
 	local deadline = tick() + APPLY_WAIT_WINDOW
-
-	local lastFingerprint = nil
-	local lastChangedAt = 0
-	local latestHumanoid = nil
-	local latestDescription = nil
-	local latestFingerprint = nil
+	local bestHumanoid = nil
+	local bestDescription = nil
+	local changedHumanoid = nil
+	local changedDescription = nil
+	local lastChangedFingerprint = nil
+	local stablePolls = 0
 
 	repeat
-		local humanoid, description, fingerprint = readCurrentDescription(0.75, 0.22)
+		local _, humanoid = getCharacterHumanoid(0.8)
+		if humanoid then
+			local description = getHumanoidDescriptionObject(humanoid, 0.25)
+			if description then
+				local fingerprint = buildDescriptionFingerprint(humanoid, description)
+				bestHumanoid = humanoid
+				bestDescription = description
 
-		if humanoid and description and fingerprint and fingerprint ~= beforeFingerprint then
-			if fingerprint ~= lastFingerprint then
-				lastFingerprint = fingerprint
-				lastChangedAt = tick()
-			end
+				if fingerprint ~= beforeFingerprint then
+					changedHumanoid = humanoid
+					changedDescription = description
 
-			latestHumanoid = humanoid
-			latestDescription = description
-			latestFingerprint = fingerprint
+					if fingerprint == lastChangedFingerprint then
+						stablePolls = stablePolls + 1
+					else
+						lastChangedFingerprint = fingerprint
+						stablePolls = 1
+					end
 
-			if tick() - lastChangedAt >= APPLY_STABLE_SECONDS then
-				task.wait(APPLY_FINAL_VERIFY_DELAY)
-
-				local finalHumanoid, finalDescription, finalFingerprint = readCurrentDescription(0.75, 0.35)
-				if finalHumanoid and finalDescription and finalFingerprint == lastFingerprint then
-					return finalHumanoid, finalDescription, finalFingerprint, true
+					if stablePolls >= APPLY_STABLE_POLLS then
+						task.wait(0.08)
+						return changedHumanoid, changedDescription
+					end
 				end
 			end
 		end
@@ -525,7 +503,11 @@ local function waitForStableChangedDescription(beforeFingerprint, previousAccept
 		task.wait(APPLY_POLL_STEP)
 	until tick() >= deadline
 
-	return latestHumanoid, latestDescription, latestFingerprint, false
+	if changedHumanoid and changedDescription then
+		return changedHumanoid, changedDescription
+	end
+
+	return bestHumanoid, bestDescription
 end
 
 local function descriptionToResult(humanoid, description)
@@ -583,43 +565,34 @@ local function descriptionToResult(humanoid, description)
 	}
 end
 
-local function makeError(message, hexCode)
-	return {
-		code = tostring(hexCode),
-		error = message,
-	}
-end
-
-local function processSingleOutfit(hexCode, requesterName, previousAcceptedFingerprint, previousCode)
+local function processSingleOutfit(hexCode, requesterName)
 	local code = tonumber(hexCode, 16)
 	if not code then
-		return makeError("Invalid outfit code", hexCode), nil
+		return { error = "Invalid outfit code" }
 	end
 
-	log("Processing outfit", requesterName .. " - " .. tostring(hexCode))
+	log("Processing - " .. requesterName .. " - code " .. tostring(code))
 
-	local humanoidBefore, beforeDescription, beforeFingerprint = readCurrentDescription(3, 1.5)
+	local _, humanoidBefore = getCharacterHumanoid(3)
 	if not humanoidBefore then
-		return makeError("Humanoid not found", hexCode), nil
-	end
-	if not beforeDescription or not beforeFingerprint then
-		return makeError("No HumanoidDescription", hexCode), nil
+		return { error = "Humanoid not found" }
 	end
 
-	log("Fetching outfit", tostring(hexCode))
+	local beforeDescription = getHumanoidDescriptionObject(humanoidBefore, 1.5)
+	if not beforeDescription then
+		return { error = "No HumanoidDescription" }
+	end
 
+	local beforeFingerprint = buildDescriptionFingerprint(humanoidBefore, beforeDescription)
 	local outfitSuccess, outfitInfo = pcall(function()
 		return CommunityRemote:InvokeServer({
 			Action = "GetFromOutfitCode",
 			OutfitCode = code,
 		})
 	end)
-
 	if not outfitSuccess or not outfitInfo then
-		return makeError("Failed to fetch outfit", hexCode), nil
+		return { error = "Failed to fetch outfit" }
 	end
-
-	log("Wearing outfit", tostring(hexCode))
 
 	local wearSuccess = pcall(function()
 		CommunityRemote:InvokeServer({
@@ -627,130 +600,68 @@ local function processSingleOutfit(hexCode, requesterName, previousAcceptedFinge
 			OutfitInfo = outfitInfo,
 		})
 	end)
-
 	if not wearSuccess then
-		return makeError("Failed to wear outfit", hexCode), nil
+		return { error = "Failed to wear outfit" }
 	end
 
-	task.wait(MIN_POST_WEAR_WAIT)
+	task.wait(0.2)
 
-	log("Reading outfit", tostring(hexCode))
-
-	local humanoidAfter, descriptionAfter, finalFingerprint, confirmed =
-		waitForStableChangedDescription(beforeFingerprint, previousAcceptedFingerprint, previousCode, hexCode)
-
-	if not confirmed or not humanoidAfter or not descriptionAfter or not finalFingerprint then
-		return makeError("Outfit failed to load fully. Please retry this code.", hexCode), nil
-	end
-
-	-- Different code returned the exact same avatar as the previous successful code.
-	-- Usually this means we caught stale data, so wait a tiny bit longer for another change.
-	if previousAcceptedFingerprint
-		and finalFingerprint == previousAcceptedFingerprint
-		and tostring(hexCode) ~= tostring(previousCode)
-	then
-		log("Possible duplicate, rechecking", tostring(hexCode))
-
-		local oldWindow = APPLY_WAIT_WINDOW
-		local retryDeadline = tick() + SUSPECT_DUPLICATE_EXTRA_WAIT
-
-		local retryHumanoid = humanoidAfter
-		local retryDescription = descriptionAfter
-		local retryFingerprint = finalFingerprint
-		local sawNew = false
-
-		repeat
-			local h, d, f = readCurrentDescription(0.75, 0.22)
-			if h and d and f and f ~= finalFingerprint and f ~= beforeFingerprint then
-				retryHumanoid = h
-				retryDescription = d
-				retryFingerprint = f
-				sawNew = true
-				break
-			end
-			task.wait(APPLY_POLL_STEP)
-		until tick() >= retryDeadline
-
-		if sawNew then
-			task.wait(APPLY_STABLE_SECONDS)
-			local h2, d2, f2 = readCurrentDescription(0.75, 0.35)
-			if h2 and d2 and f2 == retryFingerprint then
-				humanoidAfter = h2
-				descriptionAfter = d2
-				finalFingerprint = f2
-			else
-				return makeError("Possible stale duplicate read, outfit was not saved", hexCode), nil
-			end
-		else
-			return makeError("Possible stale duplicate read, outfit was not saved", hexCode), nil
+	local humanoidAfter, descriptionAfter = waitForFreshDescription(beforeFingerprint)
+	if not humanoidAfter or not descriptionAfter then
+		local _, fallbackHumanoid = getCharacterHumanoid(1.5)
+		local fallbackDescription = fallbackHumanoid and getHumanoidDescriptionObject(fallbackHumanoid, 0.5) or nil
+		if fallbackHumanoid and fallbackDescription then
+			local fallback = descriptionToResult(fallbackHumanoid, fallbackDescription)
+			log("Done - fallback read - " .. tostring(#(((fallback.Accessories or {}).Other) or {})) .. " accessories")
+			return fallback
 		end
+		return { error = "Failed to read outfit" }
 	end
 
-	return descriptionToResult(humanoidAfter, descriptionAfter), finalFingerprint
+	local result = descriptionToResult(humanoidAfter, descriptionAfter)
+	log("Done - " .. tostring(#(((result.Accessories or {}).Other) or {})) .. " accessories")
+	return result
 end
 
 local function processRequest(requestId, data)
 	isProcessing = true
 
-	local latest = getRequest(requestId) or data
-	if not latest or latest.result or latest.claimedBy ~= MY_USER_ID or latest.claimedSession ~= SESSION_ID then
-		isProcessing = false
-		return
-	end
-
-	local requesterName = latest.username or getUsername(tostring(latest.userId or "unknown"))
-	log("Processing request", requesterName .. " - " .. requestId)
+	local requesterName = data.username or getUsername(tostring(data.userId or "unknown"))
+	log("Processing request from - " .. requesterName .. " - " .. requestId)
 
 	local success, err = pcall(function()
 		local result = {}
-		local codes = latest.codes or (latest.code and { latest.code }) or {}
-
-		local previousAcceptedFingerprint = nil
-		local previousCode = nil
+		local codes = data.codes or (data.code and { data.code }) or {}
 
 		for index, hexCode in ipairs(codes) do
-			local current = getRequest(requestId)
-			if not current or current.result or current.claimedBy ~= MY_USER_ID or current.claimedSession ~= SESSION_ID then
-				return
-			end
-
-			heartbeatClaim(requestId, index)
-
-			local outfitResult, acceptedFingerprint =
-				processSingleOutfit(hexCode, requesterName, previousAcceptedFingerprint, previousCode)
-
-			result["outfit" .. index] = outfitResult or makeError("Unknown outfit error", hexCode)
-
-			if outfitResult and not outfitResult.error and acceptedFingerprint then
-				previousAcceptedFingerprint = acceptedFingerprint
-				previousCode = hexCode
-			end
-
+			result["outfit" .. index] = processSingleOutfit(hexCode, requesterName)
 			if index < #codes then
-				task.wait(BETWEEN_OUTFITS_DELAY + math.random() * 0.04)
+				task.wait(BETWEEN_OUTFITS_DELAY + math.random() * 0.06)
 			end
 		end
 
-		task.wait(0.2)
+		task.wait(0.18)
 		forceResetCharacter()
 		sendResult(requestId, result)
 	end)
 
 	if not success then
-		log("Processing error", tostring(err))
+		log("Error in processing " .. tostring(err))
 		sendResult(requestId, { error = tostring(err) })
 	end
 
 	isProcessing = false
 end
 
+task.spawn(optimizeGraphics)
+
 task.spawn(function()
 	if not refreshAuthToken() then
-		log("Initial auth failed")
+		log("Initial auth failed -> stopping")
 		return
 	end
 
-	log("Ready", "Waiting for requests")
+	log("Listener active - poll " .. tostring(POLL_INTERVAL) .. "s - optimized CAC importer")
 
 	while active do
 		if isProcessing then
@@ -764,9 +675,8 @@ task.spawn(function()
 		for requestId, data in pairs(requests) do
 			local codes = (data and data.codes) or (data and data.code and { data.code }) or {}
 			if #codes > 0 and not data.result then
-				local claimed, claimedData = tryClaim(requestId)
-				if claimed then
-					task.spawn(processRequest, requestId, claimedData or data)
+				if tryClaim(requestId) then
+					task.spawn(processRequest, requestId, data)
 					break
 				end
 			end
@@ -786,13 +696,13 @@ task.spawn(function()
 			break
 		end
 
+		log("Anti-AFK triggered")
 		pcall(function()
 			VirtualUser:CaptureController()
 			VirtualUser:ClickButton2(Vector2.new())
 		end)
-
 		task.wait(285 + math.random(0, 30))
 	end
 end)
 
-log("Ready", "Waiting for requests ta dah")
+log("CAC ready - original description reads with lighter speed tuning - 2026")
