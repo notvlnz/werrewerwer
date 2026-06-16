@@ -11,8 +11,8 @@ local Workspace = game:GetService("Workspace")
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui", 8)
 
-local FIREBASE_URL = "https://cacc-c57bf-default-rtdb.firebaseio.com/"
-local API_KEY = "AIzaSyBquxKffIm2lBtpi90GLLDdrQG_0yvlo4Y"
+local FIREBASE_URL = "https://importer-41f0d-default-rtdb.firebaseio.com/"
+local API_KEY = "AIzaSyC27Wj2awyQuzBjja4kd3t32E21oM6Sd3Y"
 
 local POLL_INTERVAL = 0.2
 local AUTH_REFRESH_MARGIN = 300
