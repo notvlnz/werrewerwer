@@ -5,24 +5,32 @@ local VirtualUser = game:GetService("VirtualUser")
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
 local StarterGui = game:GetService("StarterGui")
+local SoundService = game:GetService("SoundService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
 local Player = Players.LocalPlayer
-local PlayerGui = Player:WaitForChild("PlayerGui", 8)
 
 local FIREBASE_URL = "https://importer-41f0d-default-rtdb.firebaseio.com/"
 local API_KEY = "AIzaSyC27Wj2awyQuzBjja4kd3t32E21oM6Sd3Y"
 
-local POLL_INTERVAL = 0.2
+local POLL_INTERVAL = 0.4
+local SHOW_LOG_GUI = false
+local FPS_CAP = 30
+local DISABLE_AUDIO = true
 local AUTH_REFRESH_MARGIN = 300
-local MAX_LOG_LINES = 120
+local MAX_LOG_LINES = 30
 local CLAIM_TIMEOUT = 60
+local HTTP_MAX_ATTEMPTS = 3
+local HTTP_RETRY_BASE = 0.12
+local HTTP_TIMEOUT = 8
 
 local APPLY_WAIT_WINDOW = 5.0
 local APPLY_POLL_STEP = 0.08
 local APPLY_STABLE_POLLS = 2
-local BETWEEN_OUTFITS_DELAY = 0.4
+local BETWEEN_OUTFITS_DELAY = 0.2
+
+local PlayerGui = SHOW_LOG_GUI and Player:WaitForChild("PlayerGui", 8) or nil
 
 local CommunityRemote = ReplicatedStorage:WaitForChild("CommunityOutfitsRemote", 8)
 local CatalogGuiRemote = ReplicatedStorage:WaitForChild("CatalogGuiRemote", 8)
@@ -33,6 +41,8 @@ local active = true
 local isProcessing = false
 local currentIdToken = nil
 local tokenExpiresAt = 0
+local resetNeeded = false
+local lastWorkFinishedAt = 0
 
 local MY_USER_ID = tostring(Player.UserId)
 local usernameCache = {}
@@ -50,24 +60,47 @@ local function roundNumber(value, decimals)
 end
 
 local function optimizeGraphics()
+	local fpsCapApplied = false
+	if typeof(setfpscap) == "function" then
+		fpsCapApplied = pcall(setfpscap, FPS_CAP)
+	end
+
 	pcall(function()
 		settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
 	end)
-	pcall(function()
+	local renderingDisabled = pcall(function()
 		RunService:Set3dRenderingEnabled(false)
 	end)
 
-	Lighting.GlobalShadows = false
-	Lighting.Brightness = 1
-	Lighting.Ambient = Color3.new(1, 1, 1)
-	Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
-	Lighting.EnvironmentDiffuseScale = 0
-	Lighting.EnvironmentSpecularScale = 0
-	Lighting.Technology = Enum.Technology.Compatibility
+	if not renderingDisabled then
+		Lighting.GlobalShadows = false
+		Lighting.Brightness = 1
+		Lighting.Ambient = Color3.new(1, 1, 1)
+		Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+		Lighting.EnvironmentDiffuseScale = 0
+		Lighting.EnvironmentSpecularScale = 0
+		Lighting.Technology = Enum.Technology.Compatibility
 
-	for _, effect in ipairs(Lighting:GetChildren()) do
-		if effect:IsA("PostEffect") then
-			effect.Enabled = false
+		for _, effect in ipairs(Lighting:GetChildren()) do
+			if effect:IsA("PostEffect") then
+				effect.Enabled = false
+			end
+		end
+
+		local terrain = Workspace:FindFirstChildOfClass("Terrain")
+		if terrain then
+			terrain.WaterReflectance = 0
+			terrain.WaterTransparency = 1
+			terrain.WaterWaveSize = 0
+			terrain.WaterWaveSpeed = 0
+		end
+
+		for _, obj in ipairs(Workspace:GetDescendants()) do
+			if obj:IsA("Texture") or obj:IsA("Decal") then
+				obj.Texture = ""
+			elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
+				obj.Enabled = false
+			end
 		end
 	end
 
@@ -82,26 +115,33 @@ local function optimizeGraphics()
 		UserInputService.MouseIconEnabled = false
 	end)
 
-	local terrain = Workspace:FindFirstChildOfClass("Terrain")
-	if terrain then
-		terrain.WaterReflectance = 0
-		terrain.WaterTransparency = 1
-		terrain.WaterWaveSize = 0
-		terrain.WaterWaveSpeed = 0
-	end
-
-	for _, obj in ipairs(Workspace:GetDescendants()) do
-		if obj:IsA("Texture") or obj:IsA("Decal") then
-			obj.Texture = ""
-		elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
-			obj.Enabled = false
+	if DISABLE_AUDIO then
+		pcall(function()
+			UserSettings():GetService("UserGameSettings").MasterVolume = 0
+		end)
+		pcall(function()
+			SoundService.AmbientReverb = Enum.ReverbType.NoReverb
+			SoundService.DopplerScale = 0
+		end)
+		for _, sound in ipairs(SoundService:GetDescendants()) do
+			if sound:IsA("Sound") then
+				sound:Stop()
+				sound.Volume = 0
+			end
 		end
 	end
 
-	log("Graphics optimized for max FPS")
+	local fpsStatus = fpsCapApplied and (tostring(FPS_CAP) .. " FPS") or "FPS cap unsupported"
+	log("Headless optimizations enabled - " .. fpsStatus)
 end
 
 local function createCleanLogger()
+	if not SHOW_LOG_GUI then
+		return function(message)
+			print("[CAC] " .. message)
+		end
+	end
+
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "CACLogger"
 	gui.ResetOnSpawn = false
@@ -167,44 +207,59 @@ local function performRequest(options)
 	return HttpService:RequestAsync(options)
 end
 
-local function httpJson(method, url, body)
-	local success, response = pcall(function()
-		return performRequest({
-			Url = url,
-			Method = method,
-			Headers = {
-				["Content-Type"] = "application/json",
-				["User-Agent"] = "RobloxWinInet",
-			},
-			Body = body and HttpService:JSONEncode(body) or nil,
-		})
-	end)
-
-	if not success or not response or response.StatusCode < 200 or response.StatusCode >= 300 then
-		return nil
+local function performJsonRequest(method, url, body, extraHeaders, maxAttempts)
+	local headers = {
+		["Content-Type"] = "application/json",
+		["User-Agent"] = "RobloxWinInet",
+	}
+	for key, value in pairs(extraHeaders or {}) do
+		headers[key] = value
 	end
 
-	local ok, decoded = pcall(function()
-		return HttpService:JSONDecode(response.Body)
-	end)
+	local attempts = maxAttempts or HTTP_MAX_ATTEMPTS
+	local lastResponse = nil
+	for attempt = 1, attempts do
+		local success, response = pcall(function()
+			return performRequest({
+				Url = url,
+				Method = method,
+				Headers = headers,
+				Body = body and HttpService:JSONEncode(body) or nil,
+				Timeout = HTTP_TIMEOUT,
+			})
+		end)
 
-	return ok and decoded or nil
+		if success and response then
+			lastResponse = response
+			local status = tonumber(response.StatusCode) or 0
+			if status >= 200 and status < 300 then
+				local ok, decoded = pcall(function()
+					return HttpService:JSONDecode(response.Body)
+				end)
+				return ok and decoded or nil, response
+			end
+
+			if (status == 401 or status == 403) and string.sub(url, 1, #FIREBASE_URL) == FIREBASE_URL then
+				currentIdToken = nil
+				tokenExpiresAt = 0
+			end
+
+			if status ~= 408 and status ~= 429 and status < 500 then
+				break
+			end
+		end
+
+		if attempt < attempts then
+			task.wait(HTTP_RETRY_BASE * attempt + math.random() * 0.05)
+		end
+	end
+
+	return nil, lastResponse
 end
 
-local function patchJson(url, body)
-	local success, response = pcall(function()
-		return performRequest({
-			Url = url,
-			Method = "PATCH",
-			Headers = {
-				["Content-Type"] = "application/json",
-				["User-Agent"] = "RobloxWinInet",
-			},
-			Body = HttpService:JSONEncode(body),
-		})
-	end)
-
-	return success and response and response.StatusCode >= 200 and response.StatusCode < 300
+local function httpJson(method, url, body)
+	local decoded = performJsonRequest(method, url, body)
+	return decoded
 end
 
 local function refreshAuthToken()
@@ -240,62 +295,117 @@ local function getRequests()
 	return httpJson("GET", FIREBASE_URL .. "requests.json?auth=" .. currentIdToken) or {}
 end
 
-local function patchRequest(requestId, data)
-	if not ensureAuthToken() then
-		return false
+local function getResponseHeader(response, wantedName)
+	for name, value in pairs((response and response.Headers) or {}) do
+		if string.lower(tostring(name)) == string.lower(wantedName) then
+			return value
+		end
 	end
-
-	return patchJson(FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken, data)
+	return nil
 end
 
-local function tryClaim(requestId)
+local function tryClaimPath(relativePath)
 	if not ensureAuthToken() then
 		return false
 	end
 
-	local url = FIREBASE_URL .. "requests/" .. requestId .. ".json?auth=" .. currentIdToken
-	local current = httpJson("GET", url)
+	local url = FIREBASE_URL .. relativePath .. ".json?auth=" .. currentIdToken
+	local current, getResponse = performJsonRequest("GET", url, nil, {
+		["X-Firebase-ETag"] = "true",
+	})
 	if not current or current.result then
 		return false
 	end
 
 	local claimedAt = tonumber(current.claimedAt)
+	if claimedAt and claimedAt > 100000000000 then
+		claimedAt = claimedAt / 1000
+	end
 	local timedOut = claimedAt and current.claimedBy and (os.time() - claimedAt >= CLAIM_TIMEOUT) or false
 	if not timedOut and (current.claimedBy or current.processing) then
 		return false
 	end
 
-	local claimed = patchRequest(requestId, {
-		claimedBy = MY_USER_ID,
-		claimedAt = os.time(),
-		processing = true,
-	})
-	if not claimed then
+	local etag = getResponseHeader(getResponse, "ETag")
+	if not etag then
+		log("Claim failed (no Firebase ETag) -> " .. relativePath)
 		return false
 	end
 
-	task.wait(0.03 + math.random() * 0.04)
+	current.claimedBy = MY_USER_ID
+	current.claimedAt = { [".sv"] = "timestamp" }
+	current.processing = true
 
-	local after = httpJson("GET", url)
-	if not after or after.claimedBy ~= MY_USER_ID then
-		log("Claim lost race -> " .. requestId)
+	local _, putResponse = performJsonRequest("PUT", url, current, {
+		["if-match"] = etag,
+	}, 1)
+	if not putResponse or putResponse.StatusCode < 200 or putResponse.StatusCode >= 300 then
+		if putResponse and putResponse.StatusCode == 412 then
+			log("Claim lost race -> " .. relativePath)
+		end
 		return false
 	end
 
-	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. requestId)
+	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. relativePath)
 	return true
 end
 
+local function tryClaim(requestId)
+	return tryClaimPath("requests/" .. requestId)
+end
+
+local function tryClaimJob(requestId, jobId)
+	return tryClaimPath("requests/" .. requestId .. "/jobs/" .. jobId)
+end
+
+local function completeClaimPath(relativePath, payload)
+	for _ = 1, 2 do
+		if not ensureAuthToken() then
+			continue
+		end
+
+		local url = FIREBASE_URL .. relativePath .. ".json?auth=" .. currentIdToken
+		local current, getResponse = performJsonRequest("GET", url, nil, {
+			["X-Firebase-ETag"] = "true",
+		})
+		if not current or current.claimedBy ~= MY_USER_ID then
+			return false
+		end
+
+		local etag = getResponseHeader(getResponse, "ETag")
+		if not etag then
+			return false
+		end
+
+		current.result = payload
+		current.processing = false
+		current.finishedAt = os.time()
+
+		local _, putResponse = performJsonRequest("PUT", url, current, {
+			["if-match"] = etag,
+		}, 1)
+		if putResponse and putResponse.StatusCode >= 200 and putResponse.StatusCode < 300 then
+			return true
+		end
+		if not putResponse or putResponse.StatusCode ~= 412 then
+			return false
+		end
+	end
+	return false
+end
+
 local function sendResult(requestId, payload)
-	if patchRequest(requestId, {
-		result = payload,
-		processing = false,
-		finishedAt = os.time(),
-	}) then
+	if completeClaimPath("requests/" .. requestId, payload) then
 		log("Result sent for " .. requestId)
 	else
 		log("Failed to send result for " .. requestId)
 	end
+end
+
+local function sendJobResult(requestId, jobId, payload)
+	local sent = completeClaimPath("requests/" .. requestId .. "/jobs/" .. jobId, payload)
+	log((sent and "Job result sent for " or "Failed to send job result for ") .. requestId .. "/" .. jobId)
+	return sent
 end
 
 local function forceResetCharacter()
@@ -459,6 +569,7 @@ local function buildDescriptionFingerprint(humanoid, description)
 		tostring(description.FallAnimation or 0),
 		tostring(description.SwimAnimation or 0),
 		tostring(description.ClimbAnimation or 0),
+		tostring(description.MoodAnimation or 0),
 		getAccessoryFingerprint(description),
 	}, ";")
 end
@@ -510,21 +621,33 @@ local function waitForFreshDescription(beforeFingerprint)
 	return bestHumanoid, bestDescription
 end
 
+local ANIMATION_PROPERTIES = {
+	{ key = "walk", property = "WalkAnimation" },
+	{ key = "run", property = "RunAnimation" },
+	{ key = "jump", property = "JumpAnimation" },
+	{ key = "idle", property = "IdleAnimation" },
+	{ key = "fall", property = "FallAnimation" },
+	{ key = "swim", property = "SwimAnimation" },
+	{ key = "climb", property = "ClimbAnimation" },
+	{ key = "mood", property = "MoodAnimation" },
+}
+
+local function serializeAnimations(description)
+	local animations = {}
+
+	for _, animation in ipairs(ANIMATION_PROPERTIES) do
+		animations[animation.key] = tonumber(description[animation.property]) or 0
+	end
+	return animations
+end
+
 local function descriptionToResult(humanoid, description)
 	if not humanoid or not description then
 		return { error = "Failed to read outfit" }
 	end
 
 	local accessories = serializeAccessories(description)
-	local animations = {
-		walk = description.WalkAnimation or 0,
-		run = description.RunAnimation or 0,
-		jump = description.JumpAnimation or 0,
-		idle = description.IdleAnimation or 0,
-		fall = description.FallAnimation or 0,
-		swim = description.SwimAnimation or 0,
-		climb = description.ClimbAnimation or 0,
-	}
+	local animations = serializeAnimations(description)
 
 	return {
 		RigType = humanoid.RigType.Name,
@@ -604,7 +727,7 @@ local function processSingleOutfit(hexCode, requesterName)
 		return { error = "Failed to wear outfit" }
 	end
 
-	task.wait(0.2)
+	task.wait(0.05)
 
 	local humanoidAfter, descriptionAfter = waitForFreshDescription(beforeFingerprint)
 	if not humanoidAfter or not descriptionAfter then
@@ -653,6 +776,24 @@ local function processRequest(requestId, data)
 	isProcessing = false
 end
 
+local function processJob(requestId, jobId, requestData, jobData)
+	isProcessing = true
+
+	local requesterName = requestData.username or getUsername(tostring(requestData.userId or "unknown"))
+	log("Processing job from - " .. requesterName .. " - " .. requestId .. "/" .. jobId)
+
+	local success, result = pcall(processSingleOutfit, jobData.code, requesterName)
+	if not success then
+		log("Error in job processing " .. tostring(result))
+		result = { error = tostring(result) }
+	end
+
+	sendJobResult(requestId, jobId, result)
+	lastWorkFinishedAt = tick()
+	resetNeeded = true
+	isProcessing = false
+end
+
 task.spawn(optimizeGraphics)
 
 task.spawn(function()
@@ -669,16 +810,34 @@ task.spawn(function()
 			continue
 		end
 
+		if resetNeeded and tick() - lastWorkFinishedAt >= 1 then
+			forceResetCharacter()
+			resetNeeded = false
+		end
+
 		local startedAt = tick()
 		local requests = getRequests()
+		local workStarted = false
 
 		for requestId, data in pairs(requests) do
-			local codes = (data and data.codes) or (data and data.code and { data.code }) or {}
-			if #codes > 0 and not data.result then
-				if tryClaim(requestId) then
-					task.spawn(processRequest, requestId, data)
-					break
+			if data and data.jobs and not data.result then
+				for jobId, jobData in pairs(data.jobs) do
+					if jobData and jobData.code and not jobData.result and tryClaimJob(requestId, jobId) then
+						task.spawn(processJob, requestId, jobId, data, jobData)
+						workStarted = true
+						break
+					end
 				end
+			elseif data then
+				local codes = data.codes or (data.code and { data.code }) or {}
+				if #codes > 0 and not data.result and tryClaim(requestId) then
+					task.spawn(processRequest, requestId, data)
+					workStarted = true
+				end
+			end
+
+			if workStarted then
+				break
 			end
 		end
 
@@ -705,4 +864,4 @@ task.spawn(function()
 	end
 end)
 
-log("CAC ready - original description reads with lighter speed tuning - 2026")
+log("CAC ready - atomic parallel jobs + animation IDs - 2026")
