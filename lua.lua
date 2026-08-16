@@ -15,7 +15,7 @@ local FIREBASE_URL = "https://importer-41f0d-default-rtdb.firebaseio.com/"
 local API_KEY = "AIzaSyC27Wj2awyQuzBjja4kd3t32E21oM6Sd3Y"
 
 local POLL_INTERVAL = 0.4
-local SHOW_LOG_GUI = false
+local SHOW_LOG_GUI = true
 local FPS_CAP = 30
 local DISABLE_AUDIO = true
 local AUTH_REFRESH_MARGIN = 300
