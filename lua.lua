@@ -32,10 +32,12 @@ local BETWEEN_OUTFITS_DELAY = 0.2
 
 local PlayerGui = SHOW_LOG_GUI and Player:WaitForChild("PlayerGui", 8) or nil
 
-local CommunityRemote = ReplicatedStorage:WaitForChild("CommunityOutfitsRemote", 8)
-local CatalogGuiRemote = ReplicatedStorage:WaitForChild("CatalogGuiRemote", 8)
-local EventsFolder = ReplicatedStorage:WaitForChild("Events", 8)
-local UpdateStatusRemote = EventsFolder and EventsFolder:WaitForChild("UpdatePlayerStatus", 5)
+-- CAC moved CommunityOutfitsRemote under ReplicatedStorage.Events.
+-- Use the known new path first, while retaining the resolver below as a fallback.
+local EventsFolder = ReplicatedStorage:WaitForChild("Events", 15)
+local CommunityRemote = EventsFolder and EventsFolder:WaitForChild("CommunityOutfitsRemote", 15) or nil
+local CatalogGuiRemote = ReplicatedStorage:FindFirstChild("CatalogGuiRemote", true)
+local UpdateStatusRemote = EventsFolder and EventsFolder:FindFirstChild("UpdatePlayerStatus", true) or nil
 
 local active = true
 local isProcessing = false
@@ -198,6 +200,124 @@ local function createCleanLogger()
 end
 
 log = createCleanLogger()
+log("[BOOT] CAC IMPORTER DEBUG V5 loaded - Events/CommunityOutfitsRemote path")
+
+local function describeRemoteCandidate(instance)
+	local ok, fullName = pcall(function()
+		return instance:GetFullName()
+	end)
+	return (ok and fullName or instance.Name) .. " [" .. instance.ClassName .. "]"
+end
+
+local function logLikelyOutfitRemotes()
+	local candidates = {}
+	for _, instance in ipairs(ReplicatedStorage:GetDescendants()) do
+		if instance:IsA("RemoteFunction") or instance:IsA("RemoteEvent") then
+			local lower = string.lower(instance.Name)
+			if string.find(lower, "outfit", 1, true) or string.find(lower, "community", 1, true) then
+				table.insert(candidates, instance)
+			end
+		end
+	end
+
+	table.sort(candidates, function(a, b)
+		return a:GetFullName() < b:GetFullName()
+	end)
+
+	if #candidates == 0 then
+		log("[REMOTE-SEARCH] No RemoteFunction/RemoteEvent containing 'outfit' or 'community' exists under ReplicatedStorage")
+		return
+	end
+
+	log("[REMOTE-SEARCH] Found " .. tostring(#candidates) .. " likely remote(s):")
+	for index, instance in ipairs(candidates) do
+		if index > 20 then
+			log("[REMOTE-SEARCH] ... additional candidates omitted")
+			break
+		end
+		log("[REMOTE-SEARCH] " .. tostring(index) .. ": " .. describeRemoteCandidate(instance))
+	end
+end
+
+local function resolveCommunityRemote(verbose)
+	if CommunityRemote and CommunityRemote.Parent and CommunityRemote:IsA("RemoteFunction") then
+		return CommunityRemote
+	end
+
+	CommunityRemote = nil
+
+	-- First: CAC's current known path: ReplicatedStorage.Events.CommunityOutfitsRemote.
+	if not EventsFolder or not EventsFolder.Parent then
+		EventsFolder = ReplicatedStorage:FindFirstChild("Events") or ReplicatedStorage:FindFirstChild("Events", true)
+	end
+
+	local eventsExact = EventsFolder and EventsFolder:FindFirstChild("CommunityOutfitsRemote") or nil
+	if eventsExact and eventsExact:IsA("RemoteFunction") then
+		CommunityRemote = eventsExact
+		if verbose then
+			log("[REMOTE-SEARCH] Using current CAC path -> " .. describeRemoteCandidate(eventsExact))
+		end
+		return CommunityRemote
+	end
+
+	-- Fallback: same exact name anywhere under ReplicatedStorage in case it moves again.
+	local exact = ReplicatedStorage:FindFirstChild("CommunityOutfitsRemote", true)
+	if exact and exact:IsA("RemoteFunction") then
+		CommunityRemote = exact
+		if verbose then
+			log("[REMOTE-SEARCH] Fallback exact CommunityOutfitsRemote found -> " .. describeRemoteCandidate(exact))
+		end
+		return CommunityRemote
+	end
+
+	-- Common naming variants in case CAC renamed it slightly.
+	local aliases = {
+		"CommunityOutfitRemote",
+		"CommunityOutfits",
+		"CommunityOutfit",
+		"OutfitCommunityRemote",
+	}
+	for _, alias in ipairs(aliases) do
+		local candidate = ReplicatedStorage:FindFirstChild(alias, true)
+		if candidate and candidate:IsA("RemoteFunction") then
+			CommunityRemote = candidate
+			log("[REMOTE-SEARCH] Using renamed candidate '" .. alias .. "' -> " .. describeRemoteCandidate(candidate))
+			return CommunityRemote
+		end
+	end
+
+	-- Last safe automatic fallback: a RemoteFunction whose name contains BOTH words.
+	local fuzzy = {}
+	for _, instance in ipairs(ReplicatedStorage:GetDescendants()) do
+		if instance:IsA("RemoteFunction") then
+			local lower = string.lower(instance.Name)
+			if string.find(lower, "community", 1, true) and string.find(lower, "outfit", 1, true) then
+				table.insert(fuzzy, instance)
+			end
+		end
+	end
+
+	if #fuzzy == 1 then
+		CommunityRemote = fuzzy[1]
+		log("[REMOTE-SEARCH] Auto-selected fuzzy Community/Outfit RemoteFunction -> " .. describeRemoteCandidate(CommunityRemote))
+		return CommunityRemote
+	elseif #fuzzy > 1 then
+		log("[REMOTE-SEARCH] Multiple Community/Outfit RemoteFunctions found; refusing to guess")
+	end
+
+	if verbose then
+		log("[REMOTE-SEARCH] CommunityOutfitsRemote NOT FOUND")
+		logLikelyOutfitRemotes()
+	end
+	return nil
+end
+
+local bootCommunityRemote = resolveCommunityRemote(true)
+if bootCommunityRemote then
+	log("[BOOT] CommunityOutfitsRemote READY -> " .. describeRemoteCandidate(bootCommunityRemote))
+else
+	log("[BOOT] WARNING: CommunityOutfitsRemote still missing")
+end
 
 local function performRequest(options)
 	if requestImpl then
@@ -741,9 +861,16 @@ local function summarizeForLog(value, depth, seen)
 end
 
 local function invokeCommunityRemoteDebug(action, payload, attemptLabel)
+	local remote = resolveCommunityRemote(false)
+	if not remote then
+		log("[REMOTE] " .. tostring(action) .. " aborted -> CommunityOutfits RemoteFunction is missing")
+		logLikelyOutfitRemotes()
+		return false, nil, "CommunityOutfits RemoteFunction not found"
+	end
+
 	local startedAt = tick()
 	local success, result = pcall(function()
-		return CommunityRemote:InvokeServer(payload)
+		return remote:InvokeServer(payload)
 	end)
 	local elapsed = tick() - startedAt
 	local prefix = "[REMOTE] " .. action .. (attemptLabel and (" [" .. attemptLabel .. "]") or "")
@@ -802,7 +929,12 @@ local function processSingleOutfit(hexCode, requesterName)
 	end
 
 	log("Processing - " .. requesterName .. " - input code " .. rawCode)
-	log("[FETCH] Community remote -> " .. CommunityRemote:GetFullName() .. " (" .. CommunityRemote.ClassName .. ")")
+	local resolvedRemote = resolveCommunityRemote(true)
+	if not resolvedRemote then
+		log("[FETCH] STOPPED before outfit lookup -> Community outfit RemoteFunction is unavailable")
+		return { error = "Failed to fetch outfit" }
+	end
+	log("[FETCH] Community remote -> " .. describeRemoteCandidate(resolvedRemote))
 	log("[FETCH] Will try " .. tostring(#codeCandidates) .. " code representation(s)")
 
 	local _, humanoidBefore = getCharacterHumanoid(3)
@@ -933,10 +1065,15 @@ local function processRequest(requestId, data)
 
 	local requesterName = data.username or getUsername(tostring(data.userId or "unknown"))
 	log("Processing request from - " .. requesterName .. " - " .. requestId)
+	log("[REQUEST] raw data -> " .. summarizeForLog(data))
 
 	local success, err = pcall(function()
 		local result = {}
 		local codes = data.codes or (data.code and { data.code }) or {}
+		log("[REQUEST] resolved code count=" .. tostring(#codes))
+		for i, c in ipairs(codes) do
+			log("[REQUEST] code[" .. tostring(i) .. "] -> type=" .. typeof(c) .. " value=" .. tostring(c))
+		end
 
 		for index, hexCode in ipairs(codes) do
 			result["outfit" .. index] = processSingleOutfit(hexCode, requesterName)
@@ -964,8 +1101,18 @@ local function processJob(requestId, jobId, requestData, jobData)
 
 	local requesterName = requestData.username or getUsername(tostring(requestData.userId or "unknown"))
 	log("Processing job from - " .. requesterName .. " - " .. requestId .. "/" .. jobId)
+	log("[JOB] raw jobData -> " .. summarizeForLog(jobData))
 
-	local success, result = pcall(processSingleOutfit, jobData.code, requesterName)
+	local incomingCode = jobData and jobData.code
+	log("[JOB] code field -> type=" .. typeof(incomingCode) .. " value=" .. tostring(incomingCode))
+
+	local codeText = tostring(incomingCode or "")
+	if #codeText <= 2 then
+		log("[JOB] WARNING: received a very short outfit code (" .. codeText .. "). If you expected a CAC code such as 6 hex characters, the sender/Firebase job is probably writing the outfit INDEX instead of the actual code.")
+	end
+
+	log("[JOB] handing code to outfit fetcher NOW")
+	local success, result = pcall(processSingleOutfit, incomingCode, requesterName)
 	if not success then
 		log("[JOB] UNCAUGHT ERROR -> " .. truncateLogText(result, 500))
 		-- Do not leak debug/stack details into the result payload.
@@ -1048,4 +1195,4 @@ task.spawn(function()
 	end
 end)
 
-log("CAC ready - atomic parallel jobs + animation IDs - 2026")
+log("[BOOT] CAC ready - DEBUG V5 - Events remote + raw job/code diagnostics")
