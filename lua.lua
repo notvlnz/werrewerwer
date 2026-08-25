@@ -19,7 +19,7 @@ local SHOW_LOG_GUI = true
 local FPS_CAP = 30
 local DISABLE_AUDIO = true
 local AUTH_REFRESH_MARGIN = 300
-local MAX_LOG_LINES = 30
+local MAX_LOG_LINES = 80
 local CLAIM_TIMEOUT = 60
 local HTTP_MAX_ATTEMPTS = 3
 local HTTP_RETRY_BASE = 0.12
@@ -148,7 +148,7 @@ local function createCleanLogger()
 	gui.Parent = PlayerGui
 
 	local frame = Instance.new("Frame")
-	frame.Size = UDim2.fromOffset(540, 320)
+	frame.Size = UDim2.fromOffset(640, 500)
 	frame.Position = UDim2.fromOffset(16, 16)
 	frame.BackgroundColor3 = Color3.fromRGB(17, 17, 23)
 	frame.BorderSizePixel = 0
@@ -688,58 +688,240 @@ local function descriptionToResult(humanoid, description)
 	}
 end
 
+local function truncateLogText(value, maxLength)
+	local text = tostring(value)
+	local limit = maxLength or 220
+	if #text > limit then
+		return string.sub(text, 1, limit) .. "..."
+	end
+	return text
+end
+
+local function summarizeForLog(value, depth, seen)
+	depth = depth or 0
+	seen = seen or {}
+
+	local valueType = typeof(value)
+	if valueType == "nil" then
+		return "nil"
+	elseif valueType == "string" then
+		return string.format("%q", truncateLogText(value, 180))
+	elseif valueType == "number" or valueType == "boolean" then
+		return tostring(value)
+	elseif valueType == "Instance" then
+		local ok, fullName = pcall(function()
+			return value:GetFullName()
+		end)
+		return ok and (value.ClassName .. "<" .. fullName .. ">") or tostring(value)
+	elseif valueType ~= "table" then
+		return truncateLogText(value, 180)
+	end
+
+	if seen[value] then
+		return "<cycle>"
+	end
+	if depth >= 2 then
+		return "{...}"
+	end
+
+	seen[value] = true
+	local parts = {}
+	local count = 0
+	for key, item in pairs(value) do
+		count = count + 1
+		if count > 12 then
+			parts[#parts + 1] = "..."
+			break
+		end
+		parts[#parts + 1] = truncateLogText(key, 60) .. "=" .. summarizeForLog(item, depth + 1, seen)
+	end
+	seen[value] = nil
+
+	return "{" .. table.concat(parts, ", ") .. "}"
+end
+
+local function invokeCommunityRemoteDebug(action, payload, attemptLabel)
+	local startedAt = tick()
+	local success, result = pcall(function()
+		return CommunityRemote:InvokeServer(payload)
+	end)
+	local elapsed = tick() - startedAt
+	local prefix = "[REMOTE] " .. action .. (attemptLabel and (" [" .. attemptLabel .. "]") or "")
+
+	if not success then
+		log(prefix .. " ERROR after " .. tostring(roundNumber(elapsed, 3)) .. "s -> " .. truncateLogText(result, 320))
+		return false, nil, tostring(result)
+	end
+
+	log(prefix .. " returned in " .. tostring(roundNumber(elapsed, 3)) .. "s -> type=" .. typeof(result) .. " value=" .. summarizeForLog(result))
+	return true, result, nil
+end
+
+local function buildOutfitCodeCandidates(hexCode)
+	local rawCode = tostring(hexCode or "")
+	rawCode = string.gsub(rawCode, "^%s+", "")
+	rawCode = string.gsub(rawCode, "%s+$", "")
+
+	local candidates = {}
+	local seen = {}
+	local function add(label, value)
+		if value == nil then
+			return
+		end
+		local key = typeof(value) .. ":" .. tostring(value)
+		if seen[key] then
+			return
+		end
+		seen[key] = true
+		candidates[#candidates + 1] = {
+			label = label,
+			value = value,
+		}
+	end
+
+	-- Preserve the format this script used before first.
+	add("hex-number", tonumber(rawCode, 16))
+
+	-- Also try the visible code itself in case CAC changed the remote contract.
+	if rawCode ~= "" then
+		add("raw-string", rawCode)
+		add("uppercase-string", string.upper(rawCode))
+	end
+
+	-- Useful for requests that may already contain a decimal outfit id.
+	add("decimal-number", tonumber(rawCode))
+
+	return rawCode, candidates
+end
+
 local function processSingleOutfit(hexCode, requesterName)
-	local code = tonumber(hexCode, 16)
-	if not code then
+	local rawCode, codeCandidates = buildOutfitCodeCandidates(hexCode)
+	if rawCode == "" or #codeCandidates == 0 then
+		log("[FETCH] Invalid/empty outfit code received -> " .. summarizeForLog(hexCode))
 		return { error = "Invalid outfit code" }
 	end
 
-	log("Processing - " .. requesterName .. " - code " .. tostring(code))
+	log("Processing - " .. requesterName .. " - input code " .. rawCode)
+	log("[FETCH] Community remote -> " .. CommunityRemote:GetFullName() .. " (" .. CommunityRemote.ClassName .. ")")
+	log("[FETCH] Will try " .. tostring(#codeCandidates) .. " code representation(s)")
 
 	local _, humanoidBefore = getCharacterHumanoid(3)
 	if not humanoidBefore then
+		log("[FETCH] Aborted -> local Humanoid was not found within 3s")
 		return { error = "Humanoid not found" }
 	end
 
 	local beforeDescription = getHumanoidDescriptionObject(humanoidBefore, 1.5)
 	if not beforeDescription then
+		log("[FETCH] Aborted -> HumanoidDescription was not found within 1.5s")
 		return { error = "No HumanoidDescription" }
 	end
 
 	local beforeFingerprint = buildDescriptionFingerprint(humanoidBefore, beforeDescription)
-	local outfitSuccess, outfitInfo = pcall(function()
-		return CommunityRemote:InvokeServer({
+	log("[FETCH] Current avatar captured -> rig=" .. humanoidBefore.RigType.Name .. ", fingerprintLength=" .. tostring(beforeFingerprint and #beforeFingerprint or 0))
+
+	local outfitInfo = nil
+	local successfulFormat = nil
+	local lastRemoteError = nil
+
+	for attemptIndex, candidate in ipairs(codeCandidates) do
+		local attemptLabel = tostring(attemptIndex) .. "/" .. tostring(#codeCandidates) .. " " .. candidate.label .. "=" .. tostring(candidate.value)
+		log("[FETCH] Trying " .. attemptLabel)
+
+		local remoteSuccess, remoteResult, remoteError = invokeCommunityRemoteDebug("GetFromOutfitCode", {
 			Action = "GetFromOutfitCode",
-			OutfitCode = code,
-		})
-	end)
-	if not outfitSuccess or not outfitInfo then
+			OutfitCode = candidate.value,
+		}, attemptLabel)
+
+		if remoteSuccess and remoteResult ~= nil and remoteResult ~= false then
+			outfitInfo = remoteResult
+			successfulFormat = candidate.label
+			log("[FETCH] SUCCESS using " .. candidate.label .. " -> responseType=" .. typeof(outfitInfo))
+			break
+		end
+
+		if remoteError then
+			lastRemoteError = remoteError
+		end
+
+		if remoteSuccess then
+			log("[FETCH] Server call succeeded but returned " .. tostring(remoteResult) .. " for " .. candidate.label)
+		end
+
+		-- One small retry for actual remote exceptions/timeouts before moving formats.
+		if not remoteSuccess then
+			task.wait(0.2)
+			log("[FETCH] Retrying same format once -> " .. candidate.label)
+			local retrySuccess, retryResult, retryError = invokeCommunityRemoteDebug("GetFromOutfitCode", {
+				Action = "GetFromOutfitCode",
+				OutfitCode = candidate.value,
+			}, attemptLabel .. " retry")
+
+			if retrySuccess and retryResult ~= nil and retryResult ~= false then
+				outfitInfo = retryResult
+				successfulFormat = candidate.label
+				log("[FETCH] SUCCESS on retry using " .. candidate.label)
+				break
+			end
+
+			if retryError then
+				lastRemoteError = retryError
+			elseif retrySuccess then
+				log("[FETCH] Retry returned " .. tostring(retryResult) .. " instead of outfit data")
+			end
+		end
+
+		task.wait(0.08)
+	end
+
+	if not outfitInfo then
+		log("[FETCH] FAILED for code " .. rawCode .. " -> every representation failed")
+		if lastRemoteError then
+			log("[FETCH] Last thrown remote error -> " .. truncateLogText(lastRemoteError, 320))
+		else
+			log("[FETCH] No Lua exception was thrown; CAC returned nil/false for every attempt. This usually points to an invalid/deleted code or a changed server-side remote contract.")
+		end
+		-- Keep the result sent to Firebase/embed clean. Detailed diagnostics stay in this logger.
 		return { error = "Failed to fetch outfit" }
 	end
 
-	local wearSuccess = pcall(function()
-		CommunityRemote:InvokeServer({
-			Action = "WearCommunityOutfit",
-			OutfitInfo = outfitInfo,
-		})
-	end)
+	log("[WEAR] Applying fetched outfit -> format=" .. tostring(successfulFormat) .. ", info=" .. summarizeForLog(outfitInfo))
+	local wearSuccess, wearResult, wearError = invokeCommunityRemoteDebug("WearCommunityOutfit", {
+		Action = "WearCommunityOutfit",
+		OutfitInfo = outfitInfo,
+	}, "format=" .. tostring(successfulFormat))
+
 	if not wearSuccess then
+		log("[WEAR] FAILED -> " .. truncateLogText(wearError or "unknown InvokeServer error", 320))
 		return { error = "Failed to wear outfit" }
+	end
+
+	if wearResult == false then
+		log("[WEAR] WARNING -> remote explicitly returned false")
+	else
+		log("[WEAR] Remote accepted call -> returned " .. summarizeForLog(wearResult))
 	end
 
 	task.wait(0.05)
 
 	local humanoidAfter, descriptionAfter = waitForFreshDescription(beforeFingerprint)
 	if not humanoidAfter or not descriptionAfter then
+		log("[READ] Fresh HumanoidDescription was not available inside " .. tostring(APPLY_WAIT_WINDOW) .. "s; trying fallback read")
 		local _, fallbackHumanoid = getCharacterHumanoid(1.5)
 		local fallbackDescription = fallbackHumanoid and getHumanoidDescriptionObject(fallbackHumanoid, 0.5) or nil
 		if fallbackHumanoid and fallbackDescription then
+			local fallbackFingerprint = buildDescriptionFingerprint(fallbackHumanoid, fallbackDescription)
 			local fallback = descriptionToResult(fallbackHumanoid, fallbackDescription)
+			log("[READ] Fallback fingerprint changed=" .. tostring(fallbackFingerprint ~= beforeFingerprint))
 			log("Done - fallback read - " .. tostring(#(((fallback.Accessories or {}).Other) or {})) .. " accessories")
 			return fallback
 		end
+		log("[READ] FAILED -> no readable HumanoidDescription after wear")
 		return { error = "Failed to read outfit" }
 	end
+
+	local afterFingerprint = buildDescriptionFingerprint(humanoidAfter, descriptionAfter)
+	log("[READ] Avatar description acquired -> changed=" .. tostring(afterFingerprint ~= beforeFingerprint) .. ", rig=" .. humanoidAfter.RigType.Name)
 
 	local result = descriptionToResult(humanoidAfter, descriptionAfter)
 	log("Done - " .. tostring(#(((result.Accessories or {}).Other) or {})) .. " accessories")
@@ -769,8 +951,9 @@ local function processRequest(requestId, data)
 	end)
 
 	if not success then
-		log("Error in processing " .. tostring(err))
-		sendResult(requestId, { error = tostring(err) })
+		log("[PROCESS] UNCAUGHT ERROR -> " .. truncateLogText(err, 500))
+		-- Do not leak debug/stack details into the result payload.
+		sendResult(requestId, { error = "Internal processing error" })
 	end
 
 	isProcessing = false
@@ -784,8 +967,9 @@ local function processJob(requestId, jobId, requestData, jobData)
 
 	local success, result = pcall(processSingleOutfit, jobData.code, requesterName)
 	if not success then
-		log("Error in job processing " .. tostring(result))
-		result = { error = tostring(result) }
+		log("[JOB] UNCAUGHT ERROR -> " .. truncateLogText(result, 500))
+		-- Do not leak debug/stack details into the result payload.
+		result = { error = "Internal processing error" }
 	end
 
 	sendJobResult(requestId, jobId, result)
