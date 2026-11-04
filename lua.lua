@@ -1,3 +1,11 @@
+-- Private worker configuration. Load before worker/cac-worker.luau.
+local OUTFITY_CAC_CONFIG = {
+  firebaseUrl = "https://importer-41f0d-default-rtdb.firebaseio.com/",
+  apiKey = "AIzaSyC27Wj2awyQuzBjja4kd3t32E21oM6Sd3Y"
+}
+
+-- Outfity CAC worker: same v1/v2 Firebase payloads and game remotes.
+-- See worker/README.md before replacing an existing worker.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
@@ -10,17 +18,35 @@ local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
 local Player = Players.LocalPlayer
+local playerDeadline = os.clock() + 30
+while not Player and os.clock() < playerDeadline do
+	task.wait(0.1)
+	Player = Players.LocalPlayer
+end
+assert(Player, "Run this worker in its existing Roblox client environment, not a server Script")
 
-local FIREBASE_URL = "https://importer-41f0d-default-rtdb.firebaseio.com/"
-local API_KEY = "AIzaSyC27Wj2awyQuzBjja4kd3t32E21oM6Sd3Y"
+-- The generated file supplies a chunk-local config, with no getgenv dependency.
+-- Normal indexing also supports environments exposing globals through __index.
+local config = OUTFITY_CAC_CONFIG
+if typeof(config) ~= "table" then
+	local ok, environment = pcall(function()
+		return typeof(getgenv) == "function" and getgenv() or _G
+	end)
+	config = ok and environment and environment.OUTFITY_CAC_CONFIG or {}
+end
+if typeof(config) ~= "table" then config = {} end
+local FIREBASE_URL = tostring(config.firebaseUrl or ""):gsub("/+$", "") .. "/"
+local API_KEY = tostring(config.apiKey or "")
 
 local POLL_INTERVAL = 0.4
-local SHOW_LOG_GUI = true
+local SHOW_LOG_GUI = config.showLogGui ~= false
 local FPS_CAP = 30
 local DISABLE_AUDIO = true
 local AUTH_REFRESH_MARGIN = 300
 local MAX_LOG_LINES = 30
 local CLAIM_TIMEOUT = 60
+local MAX_JOB_ATTEMPTS = 4
+local WORKER_VERSION = "queue-v3"
 local HTTP_MAX_ATTEMPTS = 3
 local HTTP_RETRY_BASE = 0.12
 local HTTP_TIMEOUT = 8
@@ -29,26 +55,69 @@ local APPLY_WAIT_WINDOW = 5.0
 local APPLY_POLL_STEP = 0.08
 local APPLY_STABLE_POLLS = 2
 local BETWEEN_OUTFITS_DELAY = 0.2
+local MAX_CODES = 5
+local MAX_SAFE_INTEGER = 9007199254740991
+local AUTH_FAILURE_DELAY = 5
+local OUTFIT_BUSY_RETRY_DELAYS = { 2, 4, 8 }
 
 local PlayerGui = SHOW_LOG_GUI and Player:WaitForChild("PlayerGui", 8) or nil
-
-local EventsFolder = ReplicatedStorage:WaitForChild("Events", 8)
-local CommunityRemote = EventsFolder and EventsFolder:WaitForChild("CommunityOutfitsRemote", 8)
-local CatalogGuiRemote = ReplicatedStorage:WaitForChild("CatalogGuiRemote", 8)
-local UpdateStatusRemote = EventsFolder and EventsFolder:WaitForChild("UpdatePlayerStatus", 5)
+local CommunityRemote, CatalogGuiRemote, UpdateStatusRemote
+local clientId = nil
+local clientIdRequested = false
+local requireCharacterReset = false
+local workerReadyAt = 0
+local lastRequestId = nil
 
 local active = true
-local isProcessing = false
 local currentIdToken = nil
 local tokenExpiresAt = 0
+local refreshToken = nil
 local resetNeeded = false
 local lastWorkFinishedAt = 0
 
 local MY_USER_ID = tostring(Player.UserId)
-local usernameCache = {}
+local WORKER_INSTANCE_ID = MY_USER_ID .. ":" .. HttpService:GenerateGUID(false)
 
 local requestImpl = (syn and syn.request) or (http and http.request) or request
 local log
+
+local function responseOk(response)
+	local status = tonumber(response and response.StatusCode) or 0
+	return status >= 200 and status < 300
+end
+
+local function expired(data)
+	return typeof(data) == "table" and tonumber(data.expiresAt) ~= nil
+		and tonumber(data.expiresAt) <= DateTime.now().UnixTimestampMillis
+end
+
+local function retryableResult(result)
+	if typeof(result) ~= "table" or typeof(result.error) ~= "string" then return false end
+	return result.retryable == true
+		or result.error == "CAC is on cooldown. Please wait before importing again."
+		or result.error == "The outfit service is busy. Please try again shortly."
+end
+
+local function attemptCount(current)
+	local value = tonumber(current.attempts)
+	return value and value == value and value >= 0 and value < math.huge and math.floor(value) or 0
+end
+
+local function claimAvailable(current)
+	if typeof(current) ~= "table" or expired(current) then
+		return false
+	end
+	if current.result ~= nil and not (retryableResult(current.result) and attemptCount(current) < MAX_JOB_ATTEMPTS) then return false end
+	local retryAfter = tonumber(current.retryAfter)
+	if retryAfter and retryAfter > DateTime.now().UnixTimestampMillis then return false end
+	if current.result ~= nil and current.processing ~= true then return true end
+	local claimedAt = tonumber(current.claimedAt)
+	if claimedAt and claimedAt > 100000000000 then
+		claimedAt = claimedAt / 1000
+	end
+	local timedOut = claimedAt and current.claimedBy and os.time() - claimedAt >= CLAIM_TIMEOUT
+	return not (current.claimedBy or current.processing) or timedOut == true
+end
 
 local function roundNumber(value, decimals)
 	if typeof(value) ~= "number" or value ~= value then
@@ -136,7 +205,7 @@ local function optimizeGraphics()
 end
 
 local function createCleanLogger()
-	if not SHOW_LOG_GUI then
+	if not SHOW_LOG_GUI or not PlayerGui then
 		return function(message)
 			print("[CAC] " .. message)
 		end
@@ -198,25 +267,51 @@ local function createCleanLogger()
 end
 
 log = createCleanLogger()
+log("Starting CAC worker " .. WORKER_VERSION .. " - " .. WORKER_INSTANCE_ID)
+
+local function initializeWorker()
+	if not (FIREBASE_URL:match("^https://[^/]+/$") and API_KEY ~= "") then
+		log("Startup stopped: Firebase configuration is missing. Use the generated configured file.")
+		return false
+	end
+	log("Waiting for CAC game remotes")
+	local events = ReplicatedStorage:WaitForChild("Events", 30)
+	if not active then return false end
+	CommunityRemote = events and events:WaitForChild("CommunityOutfitsRemote", 30)
+	if not active then return false end
+	-- Current client scripts use Events.CatalogGuiRemote. The root location
+	-- is retained only for older deployments. Direct JSON reads do not need it.
+	CatalogGuiRemote = (events and events:FindFirstChild("CatalogGuiRemote"))
+		or ReplicatedStorage:FindFirstChild("CatalogGuiRemote")
+	if not active then return false end
+	UpdateStatusRemote = events and events:FindFirstChild("UpdatePlayerStatus")
+	if not CommunityRemote then
+		log("Startup stopped: CAC remotes were not found. Join the CAC game before starting this script.")
+		return false
+	end
+	return true
+end
 
 local function performRequest(options)
-	if requestImpl then
+	if typeof(requestImpl) == "function" then
 		return requestImpl(options)
 	end
 
-	return HttpService:RequestAsync(options)
+	local nativeOptions = table.clone(options)
+	nativeOptions.Timeout = nil -- Executor-specific; not a RequestAsync field.
+	return HttpService:RequestAsync(nativeOptions)
 end
 
 local function performJsonRequest(method, url, body, extraHeaders, maxAttempts)
 	local headers = {
 		["Content-Type"] = "application/json",
-		["User-Agent"] = "RobloxWinInet",
 	}
 	for key, value in pairs(extraHeaders or {}) do
 		headers[key] = value
 	end
 
 	local attempts = maxAttempts or HTTP_MAX_ATTEMPTS
+	local encodedBody = typeof(body) == "string" and body or (body and HttpService:JSONEncode(body) or nil)
 	local lastResponse = nil
 	for attempt = 1, attempts do
 		local success, response = pcall(function()
@@ -224,7 +319,7 @@ local function performJsonRequest(method, url, body, extraHeaders, maxAttempts)
 				Url = url,
 				Method = method,
 				Headers = headers,
-				Body = body and HttpService:JSONEncode(body) or nil,
+				Body = encodedBody,
 				Timeout = HTTP_TIMEOUT,
 			})
 		end)
@@ -250,37 +345,42 @@ local function performJsonRequest(method, url, body, extraHeaders, maxAttempts)
 		end
 
 		if attempt < attempts then
-			task.wait(HTTP_RETRY_BASE * attempt + math.random() * 0.05)
+			task.wait(HTTP_RETRY_BASE * 2 ^ (attempt - 1) + math.random() * 0.05)
 		end
 	end
 
 	return nil, lastResponse
 end
 
-local function httpJson(method, url, body)
-	local decoded = performJsonRequest(method, url, body)
-	return decoded
-end
-
 local function refreshAuthToken()
 	log("Refreshing Firebase token")
-	local data = httpJson("POST", "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. API_KEY, {
-		returnSecureToken = true,
-	})
+	local data
+	if refreshToken then
+		data = performJsonRequest("POST", "https://securetoken.googleapis.com/v1/token?key=" .. API_KEY,
+			"grant_type=refresh_token&refresh_token=" .. HttpService:UrlEncode(refreshToken), {
+				["Content-Type"] = "application/x-www-form-urlencoded",
+			})
+	else
+		data = performJsonRequest("POST", "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. API_KEY, {
+			returnSecureToken = true,
+		})
+	end
 
-	if not data or not data.idToken then
+	if typeof(data) ~= "table" or not (data.idToken or data.id_token) then
 		log("Firebase auth failed")
 		return false
 	end
 
-	currentIdToken = data.idToken
-	tokenExpiresAt = tick() + (tonumber(data.expiresIn) or 3600) - AUTH_REFRESH_MARGIN
+	currentIdToken = data.idToken or data.id_token
+	refreshToken = data.refreshToken or data.refresh_token or refreshToken
+	local lifetime = tonumber(data.expiresIn or data.expires_in) or 3600
+	tokenExpiresAt = os.clock() + math.max(1, lifetime - math.min(AUTH_REFRESH_MARGIN, lifetime / 2))
 	log("Token refreshed")
 	return true
 end
 
 local function ensureAuthToken()
-	if currentIdToken and tick() < tokenExpiresAt then
+	if currentIdToken and os.clock() < tokenExpiresAt then
 		return true
 	end
 
@@ -289,10 +389,15 @@ end
 
 local function getRequests()
 	if not ensureAuthToken() then
-		return {}
+		return nil
 	end
 
-	return httpJson("GET", FIREBASE_URL .. "requests.json?auth=" .. currentIdToken) or {}
+	local data, response = performJsonRequest("GET", FIREBASE_URL .. "requests.json?auth=" .. currentIdToken)
+	if not responseOk(response) then
+		log("Queue unavailable (HTTP " .. tostring(response and response.StatusCode or "network error") .. ")")
+		return nil
+	end
+	return typeof(data) == "table" and data or {}
 end
 
 local function getResponseHeader(response, wantedName)
@@ -304,8 +409,8 @@ local function getResponseHeader(response, wantedName)
 	return nil
 end
 
-local function tryClaimPath(relativePath)
-	if not ensureAuthToken() then
+local function tryClaimPath(relativePath, expiresAt)
+	if (expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis) or not ensureAuthToken() then
 		return false
 	end
 
@@ -313,7 +418,7 @@ local function tryClaimPath(relativePath)
 	local current, getResponse = performJsonRequest("GET", url, nil, {
 		["X-Firebase-ETag"] = "true",
 	})
-	if not current or current.result then
+	if not claimAvailable(current) then
 		return false
 	end
 
@@ -322,9 +427,6 @@ local function tryClaimPath(relativePath)
 		claimedAt = claimedAt / 1000
 	end
 	local timedOut = claimedAt and current.claimedBy and (os.time() - claimedAt >= CLAIM_TIMEOUT) or false
-	if not timedOut and (current.claimedBy or current.processing) then
-		return false
-	end
 
 	local etag = getResponseHeader(getResponse, "ETag")
 	if not etag then
@@ -332,14 +434,22 @@ local function tryClaimPath(relativePath)
 		return false
 	end
 
+	local claimId = HttpService:GenerateGUID(false)
+	current.attempts = attemptCount(current) + 1
 	current.claimedBy = MY_USER_ID
+	current.claimId = claimId
+	current.workerInstanceId = WORKER_INSTANCE_ID
+	current.workerVersion = WORKER_VERSION
 	current.claimedAt = { [".sv"] = "timestamp" }
 	current.processing = true
+	current.result = nil
+	current.retryAfter = nil
+	current.finishedAt = nil
 
 	local _, putResponse = performJsonRequest("PUT", url, current, {
 		["if-match"] = etag,
 	}, 1)
-	if not putResponse or putResponse.StatusCode < 200 or putResponse.StatusCode >= 300 then
+	if not responseOk(putResponse) then
 		if putResponse and putResponse.StatusCode == 412 then
 			log("Claim lost race -> " .. relativePath)
 		end
@@ -347,19 +457,22 @@ local function tryClaimPath(relativePath)
 	end
 
 	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. relativePath)
-	return true
+	return claimId
 end
 
-local function tryClaim(requestId)
-	return tryClaimPath("requests/" .. requestId)
+local function tryClaim(requestId, expiresAt)
+	return tryClaimPath("requests/" .. requestId, expiresAt)
 end
 
-local function tryClaimJob(requestId, jobId)
-	return tryClaimPath("requests/" .. requestId .. "/jobs/" .. jobId)
+local function tryClaimJob(requestId, jobId, expiresAt)
+	return tryClaimPath("requests/" .. requestId .. "/jobs/" .. jobId, expiresAt)
 end
 
-local function completeClaimPath(relativePath, payload)
+local function updateClaimPath(relativePath, claimId, expiresAt, update)
 	for _ = 1, 2 do
+		if expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis then
+			return false
+		end
 		if not ensureAuthToken() then
 			continue
 		end
@@ -368,7 +481,8 @@ local function completeClaimPath(relativePath, payload)
 		local current, getResponse = performJsonRequest("GET", url, nil, {
 			["X-Firebase-ETag"] = "true",
 		})
-		if not current or current.claimedBy ~= MY_USER_ID then
+		if typeof(current) ~= "table" or current.claimedBy ~= MY_USER_ID
+			or current.claimId ~= claimId or current.result ~= nil or expired(current) then
 			return false
 		end
 
@@ -377,15 +491,13 @@ local function completeClaimPath(relativePath, payload)
 			return false
 		end
 
-		current.result = payload
-		current.processing = false
-		current.finishedAt = os.time()
+		update(current)
 
 		local _, putResponse = performJsonRequest("PUT", url, current, {
 			["if-match"] = etag,
 		}, 1)
-		if putResponse and putResponse.StatusCode >= 200 and putResponse.StatusCode < 300 then
-			return true
+		if responseOk(putResponse) then
+			return true, current
 		end
 		if not putResponse or putResponse.StatusCode ~= 412 then
 			return false
@@ -394,21 +506,50 @@ local function completeClaimPath(relativePath, payload)
 	return false
 end
 
-local function sendResult(requestId, payload)
-	if completeClaimPath("requests/" .. requestId, payload) then
+local function completeClaimPath(relativePath, payload, claimId, expiresAt)
+	return updateClaimPath(relativePath, claimId, expiresAt, function(current)
+		current.result = payload
+		current.processing = false
+		current.retryAfter = nil
+		current.lastError = nil
+		current.finishedAt = os.time()
+	end)
+end
+
+local function deferClaimPath(relativePath, payload, claimId, expiresAt)
+	local saved, current = updateClaimPath(relativePath, claimId, expiresAt, function(record)
+		record.processing = false
+		if attemptCount(record) >= MAX_JOB_ATTEMPTS then
+			record.result = { error = "The outfit service is still busy after several attempts. Please try again shortly." }
+			record.finishedAt = os.time()
+			return
+		end
+		local delay = OUTFIT_BUSY_RETRY_DELAYS[math.max(1, attemptCount(record))] or OUTFIT_BUSY_RETRY_DELAYS[#OUTFIT_BUSY_RETRY_DELAYS]
+		record.result = nil
+		record.lastError = payload.error
+		record.retryAfter = DateTime.now().UnixTimestampMillis + delay * 1000
+		record.claimedBy, record.claimId, record.claimedAt = nil, nil, nil
+		record.workerInstanceId = nil
+	end)
+	return saved, saved and current.result == nil
+end
+
+local function sendResult(requestId, payload, claimId, expiresAt)
+	if completeClaimPath("requests/" .. requestId, payload, claimId, expiresAt) then
 		log("Result sent for " .. requestId)
 	else
 		log("Failed to send result for " .. requestId)
 	end
 end
 
-local function sendJobResult(requestId, jobId, payload)
-	local sent = completeClaimPath("requests/" .. requestId .. "/jobs/" .. jobId, payload)
+local function sendJobResult(requestId, jobId, payload, claimId, expiresAt)
+	local sent = completeClaimPath("requests/" .. requestId .. "/jobs/" .. jobId, payload, claimId, expiresAt)
 	log((sent and "Job result sent for " or "Failed to send job result for ") .. requestId .. "/" .. jobId)
 	return sent
 end
 
 local function forceResetCharacter()
+	if not CatalogGuiRemote then return end
 	pcall(function()
 		CatalogGuiRemote:InvokeServer({
 			Action = "MorphIntoPlayer",
@@ -424,21 +565,8 @@ local function forceResetCharacter()
 	log("Character reset")
 end
 
-local function getUsername(userIdStr)
-	if usernameCache[userIdStr] then
-		return usernameCache[userIdStr]
-	end
-
-	local success, result = pcall(function()
-		return Players:GetNameFromUserIdAsync(tonumber(userIdStr))
-	end)
-
-	usernameCache[userIdStr] = success and result or userIdStr
-	return usernameCache[userIdStr]
-end
-
 local function getCharacterHumanoid(timeoutSeconds)
-	local deadline = tick() + (timeoutSeconds or 3)
+	local deadline = os.clock() + (timeoutSeconds or 3)
 	repeat
 		local character = Player.Character
 		if character and character.Parent then
@@ -448,13 +576,13 @@ local function getCharacterHumanoid(timeoutSeconds)
 			end
 		end
 		task.wait(0.05)
-	until tick() >= deadline
+	until os.clock() >= deadline
 
 	return nil, nil
 end
 
 local function getHumanoidDescriptionObject(humanoid, timeoutSeconds)
-	local deadline = tick() + (timeoutSeconds or 2)
+	local deadline = os.clock() + (timeoutSeconds or 2)
 	repeat
 		if not humanoid then
 			break
@@ -466,7 +594,7 @@ local function getHumanoidDescriptionObject(humanoid, timeoutSeconds)
 		end
 
 		task.wait(0.05)
-	until tick() >= deadline
+	until os.clock() >= deadline
 
 	return nil
 end
@@ -527,6 +655,7 @@ local function getAccessoryFingerprint(description)
 			tostring(accessory.type or "Hat"),
 			tostring(accessory.isLayered and true or false),
 			tostring(accessory.order or 0),
+			tostring(accessory.puffiness or 0),
 		}, "|")
 	end
 
@@ -574,8 +703,8 @@ local function buildDescriptionFingerprint(humanoid, description)
 	}, ";")
 end
 
-local function waitForFreshDescription(beforeFingerprint)
-	local deadline = tick() + APPLY_WAIT_WINDOW
+local function waitForFreshDescription(beforeFingerprint, applied)
+	local deadline = os.clock() + APPLY_WAIT_WINDOW
 	local bestHumanoid = nil
 	local bestDescription = nil
 	local changedHumanoid = nil
@@ -592,7 +721,8 @@ local function waitForFreshDescription(beforeFingerprint)
 				bestHumanoid = humanoid
 				bestDescription = description
 
-				if fingerprint ~= beforeFingerprint then
+				-- A confirmed application can also be the exact same outfit.
+				if fingerprint ~= beforeFingerprint or (applied and applied.fingerprint == fingerprint) then
 					changedHumanoid = humanoid
 					changedDescription = description
 
@@ -612,7 +742,7 @@ local function waitForFreshDescription(beforeFingerprint)
 		end
 
 		task.wait(APPLY_POLL_STEP)
-	until tick() >= deadline
+	until os.clock() >= deadline
 
 	if changedHumanoid and changedDescription then
 		return changedHumanoid, changedDescription
@@ -688,13 +818,157 @@ local function descriptionToResult(humanoid, description)
 	}
 end
 
-local function processSingleOutfit(hexCode, requesterName)
-	local code = tonumber(hexCode, 16)
-	if not code then
+-- Data-only adapter for the ordered Items array observed in CAC's client
+-- serialization code. No character changes, game-module requires or asset loads.
+local OUTFIT_PROPERTIES = {
+	"BackAccessory", "FaceAccessory", "FrontAccessory", "HairAccessory",
+	"HatAccessory", "NeckAccessory", "ShouldersAccessory", "WaistAccessory",
+	"ClimbAnimation", "FallAnimation", "IdleAnimation", "JumpAnimation",
+	"RunAnimation", "SwimAnimation", "WalkAnimation",
+	"HeadColor", "LeftArmColor", "LeftLegColor", "RightArmColor", "RightLegColor", "TorsoColor",
+	"Face", "Head", "LeftArm", "LeftLeg", "RightArm", "RightLeg", "Torso",
+	"GraphicTShirt", "Pants", "Shirt", "BodyTypeScale", "DepthScale", "HeadScale",
+	"HeightScale", "ProportionScale", "WidthScale", "LayeredClothing", "MoodAnimation",
+}
+local RIGID_TYPES = { "Back", "Face", "Front", "Hair", "Hat", "Neck", "Shoulder", "Waist" }
+
+local function finiteNonnegative(value)
+	local number = tonumber(value)
+	return number and number == number and number >= 0 and number <= MAX_SAFE_INTEGER and number or nil
+end
+
+local function outfitInfoToResult(info)
+	if typeof(info) ~= "table" or typeof(info.Items) ~= "table" then
+		return nil, "Unrecognized outfit payload"
+	end
+	local rig = info.RigType or "R15"
+	if rig ~= "R6" and rig ~= "R15" then return nil, "Unrecognized outfit rig" end
+	local description, accessories = {}, {}
+	for index, property in ipairs(OUTFIT_PROPERTIES) do
+		local value = info.Items[index]
+		if index <= #RIGID_TYPES then
+			if typeof(value) ~= "string" then return nil, "Unrecognized accessory list" end
+			for asset in value:gmatch("[^,]+") do
+				local id = finiteNonnegative(asset)
+				if not id or id % 1 ~= 0 then return nil, "Invalid accessory ID" end
+				if id > 0 then
+					accessories[#accessories + 1] = { AssetId = id, AccessoryType = RIGID_TYPES[index], IsLayered = false }
+				end
+			end
+		elseif property:match("Color$") then
+			if typeof(value) ~= "string" then return nil, "Unrecognized body colour" end
+			local r, g, b = value:match("^%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)%s*$")
+			r, g, b = tonumber(r), tonumber(g), tonumber(b)
+			if not r or not g or not b or math.max(r, g, b) > 255 then return nil, "Invalid body colour" end
+			description[property] = Color3.fromRGB(r, g, b)
+		elseif property == "LayeredClothing" then
+			if value ~= nil and typeof(value) ~= "table" then return nil, "Unrecognized layered clothing" end
+			for _, item in ipairs(value or {}) do
+				if typeof(item) ~= "table" then return nil, "Invalid layered clothing" end
+				local id = finiteNonnegative(item.AssetId)
+				if not id or id % 1 ~= 0 or typeof(item.AccessoryType) ~= "string" then
+					return nil, "Invalid layered accessory"
+				end
+				accessories[#accessories + 1] = {
+					AssetId = id, AccessoryType = item.AccessoryType, IsLayered = true,
+					Order = item.Order, Puffiness = item.Puffiness,
+				}
+			end
+		else
+			-- MoodAnimation is optional in older payloads. Core fields must be
+			-- present so a shifted/new schema cannot silently produce wrong JSON.
+			if property == "MoodAnimation" and value == nil then value = 0 end
+			local number = finiteNonnegative(value)
+			if not number or (not property:match("Scale$") and number % 1 ~= 0) then
+				return nil, "Unrecognized outfit property layout"
+			end
+			description[property] = number
+		end
+	end
+	function description:GetAccessories() return accessories end
+	return descriptionToResult({ RigType = { Name = rig } }, description)
+end
+
+local function lookupOutfitOnce(code)
+	if not clientIdRequested then
+		local ok, value = pcall(function()
+			return CommunityRemote:InvokeServer({ Action = "GetClientId" })
+		end)
+		if ok and value == "OnCooldown" then
+			return nil, "rate_limited"
+		end
+		-- The inspected client forwards this opaque value unchanged; it can
+		-- be a table, not just a string/number. Do not invent or unwrap tokens.
+		clientIdRequested = true
+		if ok and value ~= nil and value ~= false then
+			clientId = value
+		else
+			-- The original working worker omitted ClientId. Let the existing
+			-- server decide whether that legacy request is supported.
+			log("Client ID unavailable; trying the original outfit lookup")
+		end
+	end
+	local ok, info = pcall(function()
+		return CommunityRemote:InvokeServer({ Action = "GetFromOutfitCode", OutfitCode = code, ClientId = clientId })
+	end)
+	if not ok then
+		if clientId == nil then clientIdRequested = false end
+		return nil, "lookup_unavailable"
+	end
+	if info == "OnCooldown" then return nil, "rate_limited" end
+	if typeof(info) ~= "table" then
+		if clientId == nil then clientIdRequested = false end
+		return nil, "Outfit code was not found"
+	end
+	if info.Hidden or info.Banned then return nil, "This outfit is unavailable" end
+	return info
+end
+
+local function fetchOutfitInfo(code, expiresAt, deferWhenBusy)
+	for attempt = 1, #OUTFIT_BUSY_RETRY_DELAYS + 1 do
+		if not active then return nil, "Import stopped" end
+		if expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis then
+			return nil, "This import expired. Please try again."
+		end
+		local info, failure = lookupOutfitOnce(code)
+		if info or (failure ~= "rate_limited" and failure ~= "lookup_unavailable") then return info, failure end
+		-- Pool jobs release their claim instead of tying up a throttled worker.
+		if deferWhenBusy then
+			return nil, failure == "rate_limited" and "The outfit service is busy. Please try again shortly."
+				or "The outfit service could not be reached. Please try again shortly.", true
+		end
+		local delay = OUTFIT_BUSY_RETRY_DELAYS[attempt]
+		if not delay then break end
+		if expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis + delay * 1000 then
+			return nil, "This import expired. Please try again."
+		end
+		log("Outfit service temporarily busy; retrying in " .. tostring(delay) .. "s")
+		task.wait(delay)
+	end
+	return nil, "The outfit service is busy. Please try again shortly.", true
+end
+
+local function processSingleOutfit(hexCode, requesterName, expiresAt, deferWhenBusy)
+	if typeof(hexCode) ~= "string" or not hexCode:match("^[%da-fA-F]+$") then
 		return { error = "Invalid outfit code" }
+	end
+	local code = tonumber(hexCode, 16)
+	if not code or code > MAX_SAFE_INTEGER or code % 1 ~= 0 then
+		return { error = "Outfit code is outside the supported numeric range" }
 	end
 
 	log("Processing - " .. requesterName .. " - code " .. tostring(code))
+	local fetchStarted = os.clock()
+	local outfitInfo, fetchError, retryable = fetchOutfitInfo(code, expiresAt, deferWhenBusy)
+	if not outfitInfo then return { error = fetchError, retryable = retryable or nil } end
+	local fetchSeconds = os.clock() - fetchStarted
+	local converted, direct, conversionError = pcall(outfitInfoToResult, outfitInfo)
+	if converted and direct then
+		log(string.format("Outfit read directly in %.2fs; no avatar change", os.clock() - fetchStarted))
+		return direct
+	end
+	log("Using character fallback: " .. (converted and conversionError or "outfit conversion unavailable"))
+	if not CatalogGuiRemote then return { error = "This outfit requires the character fallback, but CatalogGuiRemote is unavailable" } end
 
 	local _, humanoidBefore = getCharacterHumanoid(3)
 	if not humanoidBefore then
@@ -707,16 +981,19 @@ local function processSingleOutfit(hexCode, requesterName)
 	end
 
 	local beforeFingerprint = buildDescriptionFingerprint(humanoidBefore, beforeDescription)
-	local outfitSuccess, outfitInfo = pcall(function()
-		return CommunityRemote:InvokeServer({
-			Action = "GetFromOutfitCode",
-			OutfitCode = code,
-		})
-	end)
-	if not outfitSuccess or not outfitInfo then
-		return { error = "Failed to fetch outfit" }
-	end
 
+	local applied = {}
+	local appliedConnection
+	-- Some game/client versions deliver this signal; others use the existing
+	-- description polling fallback. Never assume the signal will be delivered.
+	pcall(function()
+		appliedConnection = humanoidBefore.ApplyDescriptionFinished:Connect(function(description)
+			local ok, fingerprint = pcall(buildDescriptionFingerprint, humanoidBefore, description)
+			if ok then applied.fingerprint = fingerprint end
+		end)
+	end)
+	local wearStarted = os.clock()
+	requireCharacterReset = true
 	local wearSuccess = pcall(function()
 		CommunityRemote:InvokeServer({
 			Action = "WearCommunityOutfit",
@@ -724,12 +1001,21 @@ local function processSingleOutfit(hexCode, requesterName)
 		})
 	end)
 	if not wearSuccess then
+		if appliedConnection then appliedConnection:Disconnect() end
 		return { error = "Failed to wear outfit" }
 	end
+	local wearSeconds = os.clock() - wearStarted
 
+	local settleStarted = os.clock()
 	task.wait(0.05)
 
-	local humanoidAfter, descriptionAfter = waitForFreshDescription(beforeFingerprint)
+	local readOk, humanoidAfter, descriptionAfter = pcall(waitForFreshDescription, beforeFingerprint, applied)
+	if appliedConnection then appliedConnection:Disconnect() end
+	if not readOk then
+		return { error = "Failed to read outfit description" }
+	end
+	log(string.format("Outfit timing: fetch %.2fs / apply %.2fs / settle %.2fs",
+		fetchSeconds, wearSeconds, os.clock() - settleStarted))
 	if not humanoidAfter or not descriptionAfter then
 		local _, fallbackHumanoid = getCharacterHumanoid(1.5)
 		local fallbackDescription = fallbackHumanoid and getHumanoidDescriptionObject(fallbackHumanoid, 0.5) or nil
@@ -746,122 +1032,148 @@ local function processSingleOutfit(hexCode, requesterName)
 	return result
 end
 
-local function processRequest(requestId, data)
-	isProcessing = true
+local function requesterLabel(data)
+	-- The label is only for logs. A Discord ID is not a Roblox user ID, so
+	-- avoid a potentially slow name lookup when username is absent in v2.
+	return tostring(data.username or data.userId or "unknown")
+end
 
-	local requesterName = data.username or getUsername(tostring(data.userId or "unknown"))
-	log("Processing request from - " .. requesterName .. " - " .. requestId)
+local function processRequest(requestId, data, claimId)
+	local result = {}
+	local codes = data.codes or (data.code and { data.code }) or {}
+	local count = math.min(#codes, MAX_CODES)
+	for index = 1, count do
+		if not active or expired(data) then return end
+		local ok, outfit = pcall(processSingleOutfit, codes[index], requesterLabel(data), tonumber(data.expiresAt))
+		result["outfit" .. index] = ok and outfit or { error = "Failed to process outfit" }
+		if index < count then task.wait(BETWEEN_OUTFITS_DELAY) end
+	end
+	-- Publish before resetting the character; resetting is not part of the result.
+	sendResult(requestId, result, claimId, tonumber(data.expiresAt))
+	lastWorkFinishedAt = os.clock()
+	resetNeeded = resetNeeded or requireCharacterReset
+	requireCharacterReset = false
+end
 
-	local success, err = pcall(function()
-		local result = {}
-		local codes = data.codes or (data.code and { data.code }) or {}
+local function processJob(requestId, jobId, requestData, jobData, claimId)
+	if not active or expired(requestData) then return end
+	local started = os.clock()
+	local ok, result = pcall(processSingleOutfit, jobData.code, requesterLabel(requestData), tonumber(requestData.expiresAt), true)
+	if not ok then result = { error = "Failed to process outfit" } end
+	local sent, deferred
+	if retryableResult(result) then
+		sent, deferred = deferClaimPath("requests/" .. requestId .. "/jobs/" .. jobId, result, claimId, tonumber(requestData.expiresAt))
+		workerReadyAt = os.clock() + OUTFIT_BUSY_RETRY_DELAYS[1]
+	else
+		sent = sendJobResult(requestId, jobId, result, claimId, tonumber(requestData.expiresAt))
+	end
+	lastWorkFinishedAt = os.clock()
+	resetNeeded = resetNeeded or requireCharacterReset
+	requireCharacterReset = false
+	log(string.format("Job finished in %.2fs; %s", os.clock() - started, deferred and "queued for retry" or (sent and "result saved" or "result not saved")))
+end
 
-		for index, hexCode in ipairs(codes) do
-			result["outfit" .. index] = processSingleOutfit(hexCode, requesterName)
-			if index < #codes then
-				task.wait(BETWEEN_OUTFITS_DELAY + math.random() * 0.06)
+local function sortedRequests(requests)
+	local entries = {}
+	for id, data in pairs(requests) do
+		if typeof(id) == "string" and id:match("^[%w_-]+$") and typeof(data) == "table"
+			and (data.result == nil or typeof(data.jobs) == "table") and not expired(data) then
+			entries[#entries + 1] = { id = id, data = data }
+		end
+	end
+	table.sort(entries, function(a, b)
+		local left, right = tonumber(a.data.requestedAt) or 0, tonumber(b.data.requestedAt) or 0
+		return left < right or (left == right and a.id < b.id)
+	end)
+	return entries
+end
+
+local function processQueue(requests)
+	if os.clock() < workerReadyAt then return false end
+	local entries = sortedRequests(requests)
+	local start = 1
+	for index, entry in ipairs(entries) do
+		if entry.id == lastRequestId then start = index % #entries + 1; break end
+	end
+	for offset = 0, #entries - 1 do
+		local entry = entries[(start + offset - 1) % #entries + 1]
+		local requestId, data = entry.id, entry.data
+		if not active then return end
+		local expiresAt = tonumber(data.expiresAt)
+		if typeof(data.jobs) == "table" then
+			-- Claim only one job at a time. Rotate across requests on the next
+			-- pass so a five-code batch cannot monopolize this worker.
+			for index = 1, MAX_CODES do
+				if not active or expired(data) then break end
+				local jobId = "outfit" .. index
+				local job = data.jobs[jobId]
+				if typeof(job) == "table" and job.code and claimAvailable(job) then
+					local claimId = tryClaimJob(requestId, jobId, expiresAt)
+					if claimId then
+						lastRequestId = requestId
+						processJob(requestId, jobId, data, job, claimId)
+						return true
+					end
+				end
+			end
+		else
+			local codes = data.codes or (data.code and { data.code }) or {}
+			if typeof(codes) == "table" and #codes > 0 and claimAvailable(data) then
+				local claimId = tryClaim(requestId, expiresAt)
+				if claimId then
+					lastRequestId = requestId
+					processRequest(requestId, data, claimId)
+					return true
+				end
 			end
 		end
+	end
+	return false
+end
 
-		task.wait(0.18)
-		forceResetCharacter()
-		sendResult(requestId, result)
+-- Start worker. Tests replace this section with isolated service mocks.
+if not initializeWorker() then return end
+task.spawn(function()
+	local ok = pcall(optimizeGraphics)
+	if not ok then log("Optional graphics optimizations were unavailable") end
+end)
+
+local idleConnection = Player.Idled:Connect(function()
+	if not active then return end
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
 	end)
-
-	if not success then
-		log("Error in processing " .. tostring(err))
-		sendResult(requestId, { error = tostring(err) })
-	end
-
-	isProcessing = false
-end
-
-local function processJob(requestId, jobId, requestData, jobData)
-	isProcessing = true
-
-	local requesterName = requestData.username or getUsername(tostring(requestData.userId or "unknown"))
-	log("Processing job from - " .. requesterName .. " - " .. requestId .. "/" .. jobId)
-
-	local success, result = pcall(processSingleOutfit, jobData.code, requesterName)
-	if not success then
-		log("Error in job processing " .. tostring(result))
-		result = { error = tostring(result) }
-	end
-
-	sendJobResult(requestId, jobId, result)
-	lastWorkFinishedAt = tick()
-	resetNeeded = true
-	isProcessing = false
-end
-
-task.spawn(optimizeGraphics)
+end)
 
 task.spawn(function()
-	if not refreshAuthToken() then
-		log("Initial auth failed -> stopping")
-		return
-	end
-
-	log("Listener active - poll " .. tostring(POLL_INTERVAL) .. "s - optimized CAC importer")
-
+	log("Listener active - poll " .. tostring(POLL_INTERVAL) .. "s")
 	while active do
-		if isProcessing then
-			task.wait(0.05)
+		if os.clock() < workerReadyAt then
+			task.wait(math.min(POLL_INTERVAL, workerReadyAt - os.clock()))
 			continue
 		end
-
-		if resetNeeded and tick() - lastWorkFinishedAt >= 1 then
+		local started = os.clock()
+		local didWork = false
+		local ok, requests = pcall(getRequests)
+		if ok and requests then
+			local processed, worked = pcall(processQueue, requests)
+			didWork = processed and worked == true
+			if not processed then log("Queue processing failed; retrying on the next poll") end
+		else
+			-- Do not hammer auth/Firebase every 400ms during an outage or denial.
+			task.wait(AUTH_FAILURE_DELAY)
+		end
+		if active and resetNeeded and os.clock() - lastWorkFinishedAt >= 1 then
 			forceResetCharacter()
 			resetNeeded = false
 		end
-
-		local startedAt = tick()
-		local requests = getRequests()
-		local workStarted = false
-
-		for requestId, data in pairs(requests) do
-			if data and data.jobs and not data.result then
-				for jobId, jobData in pairs(data.jobs) do
-					if jobData and jobData.code and not jobData.result and tryClaimJob(requestId, jobId) then
-						task.spawn(processJob, requestId, jobId, data, jobData)
-						workStarted = true
-						break
-					end
-				end
-			elseif data then
-				local codes = data.codes or (data.code and { data.code }) or {}
-				if #codes > 0 and not data.result and tryClaim(requestId) then
-					task.spawn(processRequest, requestId, data)
-					workStarted = true
-				end
-			end
-
-			if workStarted then
-				break
-			end
-		end
-
-		local elapsed = tick() - startedAt
-		if elapsed < POLL_INTERVAL then
-			task.wait(POLL_INTERVAL - elapsed)
-		end
+		local remaining = POLL_INTERVAL - (os.clock() - started)
+		if active then task.wait(didWork and 0 or math.max(0, remaining)) end
 	end
+	idleConnection:Disconnect()
+	log("Worker stopped")
 end)
 
-task.spawn(function()
-	while active do
-		Player.Idled:Wait()
-		if not active then
-			break
-		end
+log("CAC ready - " .. WORKER_VERSION .. " - one job per worker, fair queue and retry handoffs")
 
-		log("Anti-AFK triggered")
-		pcall(function()
-			VirtualUser:CaptureController()
-			VirtualUser:ClickButton2(Vector2.new())
-		end)
-		task.wait(285 + math.random(0, 30))
-	end
-end)
-
-log("CAC ready - atomic parallel jobs + animation IDs - 2026")
