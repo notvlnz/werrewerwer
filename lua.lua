@@ -46,7 +46,7 @@ local AUTH_REFRESH_MARGIN = 300
 local MAX_LOG_LINES = 30
 local CLAIM_TIMEOUT = 60
 local MAX_JOB_ATTEMPTS = 4
-local WORKER_VERSION = "queue-v4"
+local WORKER_VERSION = "queue-v5"
 local HTTP_MAX_ATTEMPTS = 3
 local HTTP_RETRY_BASE = 0.12
 local HTTP_TIMEOUT = 8
@@ -59,6 +59,9 @@ local MAX_CODES = 25
 local MAX_SAFE_INTEGER = 9007199254740991
 local AUTH_FAILURE_DELAY = 5
 local OUTFIT_BUSY_RETRY_DELAYS = { 2, 4, 8 }
+-- Conservative client pacing, not a claim about the game's undocumented quota.
+local LOOKUP_MIN_INTERVAL = 1
+local LOOKUP_MAX_INTERVAL = 4
 
 local PlayerGui = SHOW_LOG_GUI and Player:WaitForChild("PlayerGui", 8) or nil
 local CommunityRemote, CatalogGuiRemote, UpdateStatusRemote
@@ -67,6 +70,9 @@ local clientIdRequested = false
 local requireCharacterReset = false
 local workerReadyAt = 0
 local busyStreak = 0
+local lookupInterval = LOOKUP_MIN_INTERVAL
+local nextLookupAt = 0
+local successfulLookups = 0
 local lastRequestId = nil
 
 local active = true
@@ -890,12 +896,45 @@ local function outfitInfoToResult(info)
 	return descriptionToResult({ RigType = { Name = rig } }, description)
 end
 
-local function lookupOutfitOnce(code)
+local function waitForLookupSlot(expiresAt)
+	local delay = math.max(0, nextLookupAt - os.clock())
+	if not active then return false, "Import stopped" end
+	if expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis + delay * 1000 then
+		return false, "This import expired. Please try again."
+	end
+	if delay > 0 then task.wait(delay) end
+	if not active then return false, "Import stopped" end
+	if expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis then
+		return false, "This import expired. Please try again."
+	end
+	nextLookupAt = os.clock() + lookupInterval
+	return true
+end
+
+local function lookupCooledDown()
+	successfulLookups = 0
+	lookupInterval = math.min(LOOKUP_MAX_INTERVAL, lookupInterval + 0.5)
+	nextLookupAt = math.max(nextLookupAt, os.clock() + lookupInterval)
+	log(string.format("CAC cooldown; lookup spacing now %.2fs", lookupInterval))
+end
+
+local function lookupSucceeded()
+	successfulLookups += 1
+	if successfulLookups >= 10 then
+		successfulLookups = 0
+		lookupInterval = math.max(LOOKUP_MIN_INTERVAL, lookupInterval - 0.25)
+	end
+end
+
+local function lookupOutfitOnce(code, expiresAt)
 	if not clientIdRequested then
+		local ready, failure = waitForLookupSlot(expiresAt)
+		if not ready then return nil, failure end
 		local ok, value = pcall(function()
 			return CommunityRemote:InvokeServer({ Action = "GetClientId" })
 		end)
 		if ok and value == "OnCooldown" then
+			lookupCooledDown()
 			return nil, "rate_limited"
 		end
 		-- The inspected client forwards this opaque value unchanged; it can
@@ -909,6 +948,8 @@ local function lookupOutfitOnce(code)
 			log("Client ID unavailable; trying the original outfit lookup")
 		end
 	end
+	local ready, failure = waitForLookupSlot(expiresAt)
+	if not ready then return nil, failure end
 	local ok, info = pcall(function()
 		return CommunityRemote:InvokeServer({ Action = "GetFromOutfitCode", OutfitCode = code, ClientId = clientId })
 	end)
@@ -916,7 +957,11 @@ local function lookupOutfitOnce(code)
 		if clientId == nil then clientIdRequested = false end
 		return nil, "lookup_unavailable"
 	end
-	if info == "OnCooldown" then return nil, "rate_limited" end
+	if info == "OnCooldown" then
+		lookupCooledDown()
+		return nil, "rate_limited"
+	end
+	lookupSucceeded()
 	if typeof(info) ~= "table" then
 		if clientId == nil then clientIdRequested = false end
 		return nil, "Outfit code was not found"
@@ -931,7 +976,7 @@ local function fetchOutfitInfo(code, expiresAt, deferWhenBusy)
 		if expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis then
 			return nil, "This import expired. Please try again."
 		end
-		local info, failure = lookupOutfitOnce(code)
+		local info, failure = lookupOutfitOnce(code, expiresAt)
 		if info or (failure ~= "rate_limited" and failure ~= "lookup_unavailable") then return info, failure end
 		-- Pool jobs release their claim instead of tying up a throttled worker.
 		if deferWhenBusy then
@@ -1182,5 +1227,5 @@ task.spawn(function()
 	log("Worker stopped")
 end)
 
-log("CAC ready - " .. WORKER_VERSION .. " - one job per worker, fair queue and retry handoffs")
+log("CAC ready - " .. WORKER_VERSION .. " - paced lookups, fair queue and retry handoffs")
 
