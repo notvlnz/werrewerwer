@@ -46,7 +46,7 @@ local AUTH_REFRESH_MARGIN = 300
 local MAX_LOG_LINES = 30
 local CLAIM_TIMEOUT = 60
 local MAX_JOB_ATTEMPTS = 4
-local WORKER_VERSION = "queue-v3"
+local WORKER_VERSION = "queue-v4"
 local HTTP_MAX_ATTEMPTS = 3
 local HTTP_RETRY_BASE = 0.12
 local HTTP_TIMEOUT = 8
@@ -55,7 +55,7 @@ local APPLY_WAIT_WINDOW = 5.0
 local APPLY_POLL_STEP = 0.08
 local APPLY_STABLE_POLLS = 2
 local BETWEEN_OUTFITS_DELAY = 0.2
-local MAX_CODES = 5
+local MAX_CODES = 25
 local MAX_SAFE_INTEGER = 9007199254740991
 local AUTH_FAILURE_DELAY = 5
 local OUTFIT_BUSY_RETRY_DELAYS = { 2, 4, 8 }
@@ -66,6 +66,7 @@ local clientId = nil
 local clientIdRequested = false
 local requireCharacterReset = false
 local workerReadyAt = 0
+local busyStreak = 0
 local lastRequestId = nil
 
 local active = true
@@ -1063,8 +1064,14 @@ local function processJob(requestId, jobId, requestData, jobData, claimId)
 	local sent, deferred
 	if retryableResult(result) then
 		sent, deferred = deferClaimPath("requests/" .. requestId .. "/jobs/" .. jobId, result, claimId, tonumber(requestData.expiresAt))
-		workerReadyAt = os.clock() + OUTFIT_BUSY_RETRY_DELAYS[1]
+		-- Back off this worker across jobs, not just the individual job lease.
+		-- Otherwise a large batch keeps probing the same busy server every 2s.
+		busyStreak = math.min(busyStreak + 1, #OUTFIT_BUSY_RETRY_DELAYS)
+		local pause = OUTFIT_BUSY_RETRY_DELAYS[busyStreak]
+		workerReadyAt = os.clock() + pause
+		log("Outfit service busy; worker resting for " .. tostring(pause) .. "s")
 	else
+		busyStreak = 0
 		sent = sendJobResult(requestId, jobId, result, claimId, tonumber(requestData.expiresAt))
 	end
 	lastWorkFinishedAt = os.clock()
