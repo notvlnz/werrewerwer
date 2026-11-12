@@ -46,14 +46,12 @@ local AUTH_REFRESH_MARGIN = 300
 local MAX_LOG_LINES = 30
 local CLAIM_TIMEOUT = 60
 local MAX_JOB_ATTEMPTS = 4
-local WORKER_VERSION = "queue-v5"
+local WORKER_VERSION = "queue-v8"
 local HTTP_MAX_ATTEMPTS = 3
 local HTTP_RETRY_BASE = 0.12
 local HTTP_TIMEOUT = 8
+local REMOTE_TIMEOUT = 10
 
-local APPLY_WAIT_WINDOW = 5.0
-local APPLY_POLL_STEP = 0.08
-local APPLY_STABLE_POLLS = 2
 local BETWEEN_OUTFITS_DELAY = 0.2
 local MAX_CODES = 25
 local MAX_SAFE_INTEGER = 9007199254740991
@@ -62,25 +60,26 @@ local OUTFIT_BUSY_RETRY_DELAYS = { 2, 4, 8 }
 -- Conservative client pacing, not a claim about the game's undocumented quota.
 local LOOKUP_MIN_INTERVAL = 1
 local LOOKUP_MAX_INTERVAL = 4
+local DIRECT_CACHE_TTL = 30
+local DIRECT_CACHE_LIMIT = 128
 
 local PlayerGui = SHOW_LOG_GUI and Player:WaitForChild("PlayerGui", 8) or nil
-local CommunityRemote, CatalogGuiRemote, UpdateStatusRemote
+local CommunityRemote
 local clientId = nil
 local clientIdRequested = false
-local requireCharacterReset = false
 local workerReadyAt = 0
 local busyStreak = 0
 local lookupInterval = LOOKUP_MIN_INTERVAL
 local nextLookupAt = 0
 local successfulLookups = 0
 local lastRequestId = nil
+local ownedClaim = nil
+local directCache = {}
 
 local active = true
 local currentIdToken = nil
 local tokenExpiresAt = 0
 local refreshToken = nil
-local resetNeeded = false
-local lastWorkFinishedAt = 0
 
 local MY_USER_ID = tostring(Player.UserId)
 local WORKER_INSTANCE_ID = MY_USER_ID .. ":" .. HttpService:GenerateGUID(false)
@@ -286,17 +285,30 @@ local function initializeWorker()
 	if not active then return false end
 	CommunityRemote = events and events:WaitForChild("CommunityOutfitsRemote", 30)
 	if not active then return false end
-	-- Current client scripts use Events.CatalogGuiRemote. The root location
-	-- is retained only for older deployments. Direct JSON reads do not need it.
-	CatalogGuiRemote = (events and events:FindFirstChild("CatalogGuiRemote"))
-		or ReplicatedStorage:FindFirstChild("CatalogGuiRemote")
-	if not active then return false end
-	UpdateStatusRemote = events and events:FindFirstChild("UpdatePlayerStatus")
 	if not CommunityRemote then
 		log("Startup stopped: CAC remotes were not found. Join the CAC game before starting this script.")
 		return false
 	end
 	return true
+end
+
+local function boundedCall(callback, timeoutSeconds, expiresAt)
+	local deadline = os.clock() + timeoutSeconds
+	if expiresAt then
+		deadline = math.min(deadline, os.clock() + math.max(0, (expiresAt - DateTime.now().UnixTimestampMillis) / 1000))
+	end
+	if not active or os.clock() >= deadline then return false, "Call timed out", true end
+	local result
+	local thread = task.spawn(function()
+		result = table.pack(pcall(callback))
+	end)
+	while not result and active and os.clock() < deadline do
+		task.wait(math.min(0.05, deadline - os.clock()))
+	end
+	if result then return table.unpack(result, 1, result.n) end
+	-- Cancels the local waiter only; callers must account for server-side work.
+	pcall(task.cancel, thread)
+	return false, "Call timed out", true
 end
 
 local function performRequest(options)
@@ -321,7 +333,7 @@ local function performJsonRequest(method, url, body, extraHeaders, maxAttempts)
 	local encodedBody = typeof(body) == "string" and body or (body and HttpService:JSONEncode(body) or nil)
 	local lastResponse = nil
 	for attempt = 1, attempts do
-		local success, response = pcall(function()
+		local success, response = boundedCall(function()
 			return performRequest({
 				Url = url,
 				Method = method,
@@ -329,7 +341,7 @@ local function performJsonRequest(method, url, body, extraHeaders, maxAttempts)
 				Body = encodedBody,
 				Timeout = HTTP_TIMEOUT,
 			})
-		end)
+		end, HTTP_TIMEOUT)
 
 		if success and response then
 			lastResponse = response
@@ -417,6 +429,7 @@ local function getResponseHeader(response, wantedName)
 end
 
 local function tryClaimPath(relativePath, expiresAt)
+	local started = os.clock()
 	if (expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis) or not ensureAuthToken() then
 		return false
 	end
@@ -453,8 +466,9 @@ local function tryClaimPath(relativePath, expiresAt)
 	current.retryAfter = nil
 	current.finishedAt = nil
 
-	local _, putResponse = performJsonRequest("PUT", url, current, {
+	local claimed, putResponse = performJsonRequest("PUT", url, current, {
 		["if-match"] = etag,
+		["X-Firebase-ETag"] = "true",
 	}, 1)
 	if not responseOk(putResponse) then
 		if putResponse and putResponse.StatusCode == 412 then
@@ -462,8 +476,17 @@ local function tryClaimPath(relativePath, expiresAt)
 		end
 		return false
 	end
+	-- Firebase returns the committed value and its new ETag. Reuse both for
+	-- the next conditional write, saving a GET without weakening ownership.
+	local claimedEtag = getResponseHeader(putResponse, "ETag")
+	ownedClaim = nil
+	if claimedEtag and typeof(claimed) == "table" and claimed.claimId == claimId
+		and claimed.claimedBy == MY_USER_ID and typeof(claimed.claimedAt) == "number" then
+		ownedClaim = { path = relativePath, id = claimId, etag = claimedEtag, value = claimed }
+	end
 
-	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. relativePath)
+	log((timedOut and "Reclaimed timed out -> " or "Claimed -> ") .. relativePath
+		.. string.format(" (%.2fs)", os.clock() - started))
 	return claimId
 end
 
@@ -476,6 +499,9 @@ local function tryClaimJob(requestId, jobId, expiresAt)
 end
 
 local function updateClaimPath(relativePath, claimId, expiresAt, update)
+	local cached = ownedClaim
+	if cached and cached.id == claimId then ownedClaim = nil end
+	if cached and (cached.id ~= claimId or cached.path ~= relativePath) then cached = nil end
 	for _ = 1, 2 do
 		if expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis then
 			return false
@@ -485,15 +511,22 @@ local function updateClaimPath(relativePath, claimId, expiresAt, update)
 		end
 
 		local url = FIREBASE_URL .. relativePath .. ".json?auth=" .. currentIdToken
-		local current, getResponse = performJsonRequest("GET", url, nil, {
-			["X-Firebase-ETag"] = "true",
-		})
+		local current, etag
+		if cached then
+			current, etag = cached.value, cached.etag
+			cached = nil
+		else
+			local getResponse
+			current, getResponse = performJsonRequest("GET", url, nil, {
+				["X-Firebase-ETag"] = "true",
+			})
+			etag = getResponseHeader(getResponse, "ETag")
+		end
 		if typeof(current) ~= "table" or current.claimedBy ~= MY_USER_ID
 			or current.claimId ~= claimId or current.result ~= nil or expired(current) then
 			return false
 		end
 
-		local etag = getResponseHeader(getResponse, "ETag")
 		if not etag then
 			return false
 		end
@@ -506,9 +539,11 @@ local function updateClaimPath(relativePath, claimId, expiresAt, update)
 		if responseOk(putResponse) then
 			return true, current
 		end
-		if not putResponse or putResponse.StatusCode ~= 412 then
+		local status = tonumber(putResponse and putResponse.StatusCode) or 0
+		if status ~= 0 and status ~= 401 and status ~= 408 and status ~= 412 and status ~= 429 and status < 500 then
 			return false
 		end
+		-- Refetch ownership and ETag before retrying an uncertain write.
 	end
 	return false
 end
@@ -553,57 +588,6 @@ local function sendJobResult(requestId, jobId, payload, claimId, expiresAt)
 	local sent = completeClaimPath("requests/" .. requestId .. "/jobs/" .. jobId, payload, claimId, expiresAt)
 	log((sent and "Job result sent for " or "Failed to send job result for ") .. requestId .. "/" .. jobId)
 	return sent
-end
-
-local function forceResetCharacter()
-	if not CatalogGuiRemote then return end
-	pcall(function()
-		CatalogGuiRemote:InvokeServer({
-			Action = "MorphIntoPlayer",
-			UserId = Player.UserId,
-			RigType = Enum.HumanoidRigType.R15,
-		})
-	end)
-	pcall(function()
-		if UpdateStatusRemote then
-			UpdateStatusRemote:FireServer("None")
-		end
-	end)
-	log("Character reset")
-end
-
-local function getCharacterHumanoid(timeoutSeconds)
-	local deadline = os.clock() + (timeoutSeconds or 3)
-	repeat
-		local character = Player.Character
-		if character and character.Parent then
-			local humanoid = character:FindFirstChildOfClass("Humanoid")
-			if humanoid then
-				return character, humanoid
-			end
-		end
-		task.wait(0.05)
-	until os.clock() >= deadline
-
-	return nil, nil
-end
-
-local function getHumanoidDescriptionObject(humanoid, timeoutSeconds)
-	local deadline = os.clock() + (timeoutSeconds or 2)
-	repeat
-		if not humanoid then
-			break
-		end
-
-		local description = humanoid:FindFirstChild("HumanoidDescription")
-		if description and description:IsA("HumanoidDescription") then
-			return description
-		end
-
-		task.wait(0.05)
-	until os.clock() >= deadline
-
-	return nil
 end
 
 local function getAccessoryTypeName(accessoryType)
@@ -651,111 +635,6 @@ local function serializeAccessories(description)
 	end)
 
 	return result
-end
-
-local function getAccessoryFingerprint(description)
-	local accessories = serializeAccessories(description)
-	local parts = {}
-	for _, accessory in ipairs(accessories) do
-		parts[#parts + 1] = table.concat({
-			tostring(accessory.assetId or 0),
-			tostring(accessory.type or "Hat"),
-			tostring(accessory.isLayered and true or false),
-			tostring(accessory.order or 0),
-			tostring(accessory.puffiness or 0),
-		}, "|")
-	end
-
-	return table.concat(parts, ",")
-end
-
-local function buildDescriptionFingerprint(humanoid, description)
-	if not humanoid or not description then
-		return nil
-	end
-
-	return table.concat({
-		humanoid.RigType.Name,
-		tostring(description.Shirt or 0),
-		tostring(description.Pants or 0),
-		tostring(description.GraphicTShirt or 0),
-		tostring(description.Head or 0),
-		tostring(description.Torso or 0),
-		tostring(description.LeftArm or 0),
-		tostring(description.RightArm or 0),
-		tostring(description.LeftLeg or 0),
-		tostring(description.RightLeg or 0),
-		tostring(description.Face or 0),
-		description.HeadColor:ToHex(),
-		description.TorsoColor:ToHex(),
-		description.LeftArmColor:ToHex(),
-		description.RightArmColor:ToHex(),
-		description.LeftLegColor:ToHex(),
-		description.RightLegColor:ToHex(),
-		tostring(roundNumber(description.HeightScale or 0, 4)),
-		tostring(roundNumber(description.WidthScale or 0, 4)),
-		tostring(roundNumber(description.HeadScale or 0, 4)),
-		tostring(roundNumber(description.DepthScale or 0, 4)),
-		tostring(roundNumber(description.ProportionScale or 0, 4)),
-		tostring(roundNumber(description.BodyTypeScale or 0, 4)),
-		tostring(description.WalkAnimation or 0),
-		tostring(description.RunAnimation or 0),
-		tostring(description.JumpAnimation or 0),
-		tostring(description.IdleAnimation or 0),
-		tostring(description.FallAnimation or 0),
-		tostring(description.SwimAnimation or 0),
-		tostring(description.ClimbAnimation or 0),
-		tostring(description.MoodAnimation or 0),
-		getAccessoryFingerprint(description),
-	}, ";")
-end
-
-local function waitForFreshDescription(beforeFingerprint, applied)
-	local deadline = os.clock() + APPLY_WAIT_WINDOW
-	local bestHumanoid = nil
-	local bestDescription = nil
-	local changedHumanoid = nil
-	local changedDescription = nil
-	local lastChangedFingerprint = nil
-	local stablePolls = 0
-
-	repeat
-		local _, humanoid = getCharacterHumanoid(0.8)
-		if humanoid then
-			local description = getHumanoidDescriptionObject(humanoid, 0.25)
-			if description then
-				local fingerprint = buildDescriptionFingerprint(humanoid, description)
-				bestHumanoid = humanoid
-				bestDescription = description
-
-				-- A confirmed application can also be the exact same outfit.
-				if fingerprint ~= beforeFingerprint or (applied and applied.fingerprint == fingerprint) then
-					changedHumanoid = humanoid
-					changedDescription = description
-
-					if fingerprint == lastChangedFingerprint then
-						stablePolls = stablePolls + 1
-					else
-						lastChangedFingerprint = fingerprint
-						stablePolls = 1
-					end
-
-					if stablePolls >= APPLY_STABLE_POLLS then
-						task.wait(0.08)
-						return changedHumanoid, changedDescription
-					end
-				end
-			end
-		end
-
-		task.wait(APPLY_POLL_STEP)
-	until os.clock() >= deadline
-
-	if changedHumanoid and changedDescription then
-		return changedHumanoid, changedDescription
-	end
-
-	return bestHumanoid, bestDescription
 end
 
 local ANIMATION_PROPERTIES = {
@@ -930,9 +809,10 @@ local function lookupOutfitOnce(code, expiresAt)
 	if not clientIdRequested then
 		local ready, failure = waitForLookupSlot(expiresAt)
 		if not ready then return nil, failure end
-		local ok, value = pcall(function()
+		local ok, value, timedOut = boundedCall(function()
 			return CommunityRemote:InvokeServer({ Action = "GetClientId" })
-		end)
+		end, REMOTE_TIMEOUT, expiresAt)
+		if not ok and timedOut then return nil, "lookup_unavailable" end
 		if ok and value == "OnCooldown" then
 			lookupCooledDown()
 			return nil, "rate_limited"
@@ -950,9 +830,9 @@ local function lookupOutfitOnce(code, expiresAt)
 	end
 	local ready, failure = waitForLookupSlot(expiresAt)
 	if not ready then return nil, failure end
-	local ok, info = pcall(function()
+	local ok, info, lookupStatus = boundedCall(function()
 		return CommunityRemote:InvokeServer({ Action = "GetFromOutfitCode", OutfitCode = code, ClientId = clientId })
-	end)
+	end, REMOTE_TIMEOUT, expiresAt)
 	if not ok then
 		if clientId == nil then clientIdRequested = false end
 		return nil, "lookup_unavailable"
@@ -961,11 +841,15 @@ local function lookupOutfitOnce(code, expiresAt)
 		lookupCooledDown()
 		return nil, "rate_limited"
 	end
-	lookupSucceeded()
 	if typeof(info) ~= "table" then
 		if clientId == nil then clientIdRequested = false end
+		-- Both game clients distinguish a confirmed missing code (200) from
+		-- a failed backend lookup using the remote's second return value.
+		if lookupStatus ~= 200 then return nil, "lookup_unavailable" end
+		lookupSucceeded()
 		return nil, "Outfit code was not found"
 	end
+	lookupSucceeded()
 	if info.Hidden or info.Banned then return nil, "This outfit is unavailable" end
 	return info
 end
@@ -994,7 +878,32 @@ local function fetchOutfitInfo(code, expiresAt, deferWhenBusy)
 	return nil, "The outfit service is busy. Please try again shortly.", true
 end
 
-local function processSingleOutfit(hexCode, requesterName, expiresAt, deferWhenBusy)
+local function copyResult(value)
+	if typeof(value) ~= "table" then return value end
+	local result = {}
+	for key, item in pairs(value) do result[key] = copyResult(item) end
+	return result
+end
+
+local function rememberDirectResult(key, result, expiresAt)
+	local now = DateTime.now().UnixTimestampMillis
+	local count, oldestKey, oldestExpiry = 0, nil, math.huge
+	for id, entry in pairs(directCache) do
+		if entry.expiresAt <= now then
+			directCache[id] = nil
+		else
+			count += 1
+			if entry.expiresAt < oldestExpiry then oldestKey, oldestExpiry = id, entry.expiresAt end
+		end
+	end
+	if count >= DIRECT_CACHE_LIMIT and oldestKey then directCache[oldestKey] = nil end
+	directCache[key] = {
+		result = copyResult(result),
+		expiresAt = math.min(expiresAt or math.huge, now + DIRECT_CACHE_TTL * 1000),
+	}
+end
+
+local function processSingleOutfit(hexCode, requesterName, expiresAt, deferWhenBusy, requestId)
 	if typeof(hexCode) ~= "string" or not hexCode:match("^[%da-fA-F]+$") then
 		return { error = "Invalid outfit code" }
 	end
@@ -1002,80 +911,29 @@ local function processSingleOutfit(hexCode, requesterName, expiresAt, deferWhenB
 	if not code or code > MAX_SAFE_INTEGER or code % 1 ~= 0 then
 		return { error = "Outfit code is outside the supported numeric range" }
 	end
+	if not active then return { error = "Import stopped" } end
+	if expiresAt and expiresAt <= DateTime.now().UnixTimestampMillis then
+		return { error = "This import expired. Please try again." }
+	end
+	local cacheKey = requestId and (requestId .. ":" .. tostring(code)) or nil
+	local cached = cacheKey and directCache[cacheKey]
+	if cached and cached.expiresAt > DateTime.now().UnixTimestampMillis then
+		log("Reusing direct result for a duplicate code in this batch")
+		return copyResult(cached.result)
+	end
 
 	log("Processing - " .. requesterName .. " - code " .. tostring(code))
 	local fetchStarted = os.clock()
 	local outfitInfo, fetchError, retryable = fetchOutfitInfo(code, expiresAt, deferWhenBusy)
 	if not outfitInfo then return { error = fetchError, retryable = retryable or nil } end
-	local fetchSeconds = os.clock() - fetchStarted
 	local converted, direct, conversionError = pcall(outfitInfoToResult, outfitInfo)
 	if converted and direct then
+		if cacheKey then rememberDirectResult(cacheKey, direct, expiresAt) end
 		log(string.format("Outfit read directly in %.2fs; no avatar change", os.clock() - fetchStarted))
 		return direct
 	end
-	log("Using character fallback: " .. (converted and conversionError or "outfit conversion unavailable"))
-	if not CatalogGuiRemote then return { error = "This outfit requires the character fallback, but CatalogGuiRemote is unavailable" } end
-
-	local _, humanoidBefore = getCharacterHumanoid(3)
-	if not humanoidBefore then
-		return { error = "Humanoid not found" }
-	end
-
-	local beforeDescription = getHumanoidDescriptionObject(humanoidBefore, 1.5)
-	if not beforeDescription then
-		return { error = "No HumanoidDescription" }
-	end
-
-	local beforeFingerprint = buildDescriptionFingerprint(humanoidBefore, beforeDescription)
-
-	local applied = {}
-	local appliedConnection
-	-- Some game/client versions deliver this signal; others use the existing
-	-- description polling fallback. Never assume the signal will be delivered.
-	pcall(function()
-		appliedConnection = humanoidBefore.ApplyDescriptionFinished:Connect(function(description)
-			local ok, fingerprint = pcall(buildDescriptionFingerprint, humanoidBefore, description)
-			if ok then applied.fingerprint = fingerprint end
-		end)
-	end)
-	local wearStarted = os.clock()
-	requireCharacterReset = true
-	local wearSuccess = pcall(function()
-		CommunityRemote:InvokeServer({
-			Action = "WearCommunityOutfit",
-			OutfitInfo = outfitInfo,
-		})
-	end)
-	if not wearSuccess then
-		if appliedConnection then appliedConnection:Disconnect() end
-		return { error = "Failed to wear outfit" }
-	end
-	local wearSeconds = os.clock() - wearStarted
-
-	local settleStarted = os.clock()
-	task.wait(0.05)
-
-	local readOk, humanoidAfter, descriptionAfter = pcall(waitForFreshDescription, beforeFingerprint, applied)
-	if appliedConnection then appliedConnection:Disconnect() end
-	if not readOk then
-		return { error = "Failed to read outfit description" }
-	end
-	log(string.format("Outfit timing: fetch %.2fs / apply %.2fs / settle %.2fs",
-		fetchSeconds, wearSeconds, os.clock() - settleStarted))
-	if not humanoidAfter or not descriptionAfter then
-		local _, fallbackHumanoid = getCharacterHumanoid(1.5)
-		local fallbackDescription = fallbackHumanoid and getHumanoidDescriptionObject(fallbackHumanoid, 0.5) or nil
-		if fallbackHumanoid and fallbackDescription then
-			local fallback = descriptionToResult(fallbackHumanoid, fallbackDescription)
-			log("Done - fallback read - " .. tostring(#(((fallback.Accessories or {}).Other) or {})) .. " accessories")
-			return fallback
-		end
-		return { error = "Failed to read outfit" }
-	end
-
-	local result = descriptionToResult(humanoidAfter, descriptionAfter)
-	log("Done - " .. tostring(#(((result.Accessories or {}).Other) or {})) .. " accessories")
-	return result
+	log("Unsupported direct outfit data: " .. (converted and conversionError or "conversion failed"))
+	return { error = "This outfit uses an unsupported data format. The worker could not import it directly." }
 end
 
 local function requesterLabel(data)
@@ -1090,22 +948,19 @@ local function processRequest(requestId, data, claimId)
 	local count = math.min(#codes, MAX_CODES)
 	for index = 1, count do
 		if not active or expired(data) then return end
-		local ok, outfit = pcall(processSingleOutfit, codes[index], requesterLabel(data), tonumber(data.expiresAt))
+		local ok, outfit = pcall(processSingleOutfit, codes[index], requesterLabel(data), tonumber(data.expiresAt), false, requestId)
 		result["outfit" .. index] = ok and outfit or { error = "Failed to process outfit" }
 		if index < count then task.wait(BETWEEN_OUTFITS_DELAY) end
 	end
-	-- Publish before resetting the character; resetting is not part of the result.
 	sendResult(requestId, result, claimId, tonumber(data.expiresAt))
-	lastWorkFinishedAt = os.clock()
-	resetNeeded = resetNeeded or requireCharacterReset
-	requireCharacterReset = false
 end
 
 local function processJob(requestId, jobId, requestData, jobData, claimId)
 	if not active or expired(requestData) then return end
 	local started = os.clock()
-	local ok, result = pcall(processSingleOutfit, jobData.code, requesterLabel(requestData), tonumber(requestData.expiresAt), true)
+	local ok, result = pcall(processSingleOutfit, jobData.code, requesterLabel(requestData), tonumber(requestData.expiresAt), true, requestId)
 	if not ok then result = { error = "Failed to process outfit" } end
+	local lookupFinished = os.clock()
 	local sent, deferred
 	if retryableResult(result) then
 		sent, deferred = deferClaimPath("requests/" .. requestId .. "/jobs/" .. jobId, result, claimId, tonumber(requestData.expiresAt))
@@ -1119,10 +974,9 @@ local function processJob(requestId, jobId, requestData, jobData, claimId)
 		busyStreak = 0
 		sent = sendJobResult(requestId, jobId, result, claimId, tonumber(requestData.expiresAt))
 	end
-	lastWorkFinishedAt = os.clock()
-	resetNeeded = resetNeeded or requireCharacterReset
-	requireCharacterReset = false
-	log(string.format("Job finished in %.2fs; %s", os.clock() - started, deferred and "queued for retry" or (sent and "result saved" or "result not saved")))
+	log(string.format("Job finished in %.2fs (lookup %.2fs / save %.2fs); %s",
+		os.clock() - started, lookupFinished - started, os.clock() - lookupFinished,
+		deferred and "queued for retry" or (sent and "result saved" or "result not saved")))
 end
 
 local function sortedRequests(requests)
@@ -1216,10 +1070,6 @@ task.spawn(function()
 			-- Do not hammer auth/Firebase every 400ms during an outage or denial.
 			task.wait(AUTH_FAILURE_DELAY)
 		end
-		if active and resetNeeded and os.clock() - lastWorkFinishedAt >= 1 then
-			forceResetCharacter()
-			resetNeeded = false
-		end
 		local remaining = POLL_INTERVAL - (os.clock() - started)
 		if active then task.wait(didWork and 0 or math.max(0, remaining)) end
 	end
@@ -1227,5 +1077,5 @@ task.spawn(function()
 	log("Worker stopped")
 end)
 
-log("CAC ready - " .. WORKER_VERSION .. " - paced lookups, fair queue and retry handoffs")
+log("CAC ready - " .. WORKER_VERSION .. " - direct-only imports, result reuse and retry handoffs")
 
